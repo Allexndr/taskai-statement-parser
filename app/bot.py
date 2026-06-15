@@ -555,22 +555,16 @@ async def handle_callback(callback: types.CallbackQuery):
 # ═══ MESSAGE HANDLER (Free text / voice) ═══
 
 async def get_user_context(session, user_id: str) -> dict:
-    """Load full user context from DB for the agent. Run queries in parallel."""
+    """Load full user context from DB for the agent. Sequential to avoid session concurrency issues."""
     ctx = {}
 
-    # Run all independent queries in parallel
-    fs_task = asyncio.create_task(get_or_create_finance_settings(session, user_id))
-    stats_task = asyncio.create_task(get_monthly_stats(session, user_id))
-    tasks_task = asyncio.create_task(get_user_tasks(session, user_id, status="new", limit=20))
-    today_task = asyncio.create_task(get_today_tasks(session, user_id))
-    wishes_task = asyncio.create_task(get_active_wishes(session, user_id))
-
-    fs, stats, tasks, today, wishes = await asyncio.gather(
-        fs_task, stats_task, tasks_task, today_task, wishes_task
-    )
-
+    # Finance settings
+    fs = await get_or_create_finance_settings(session, user_id)
     ctx["salary"] = fs.monthly_salary
     ctx["fixed_expenses"] = fs.monthly_expenses
+
+    # Monthly stats (3 queries inside but all sequential, fast)
+    stats = await get_monthly_stats(session, user_id)
     ctx["monthly_income"] = stats["income"]
     ctx["monthly_expenses"] = stats["expenses"]
 
@@ -587,8 +581,15 @@ async def get_user_context(session, user_id: str) -> dict:
     top = dict(sorted(stats["by_category"].items(), key=lambda x: x[1], reverse=True)[:3])
     ctx["top_expenses"] = ", ".join([f"{k}: {v/100:,.0f}₽" for k, v in top.items()]) if top else None
 
+    # Tasks
+    tasks = await get_user_tasks(session, user_id, status="new", limit=20)
     ctx["active_tasks_count"] = len(tasks)
+
+    today = await get_today_tasks(session, user_id)
     ctx["today_tasks"] = [t.title for t in today[:5]] if today else []
+
+    # Wishes
+    wishes = await get_active_wishes(session, user_id)
     ctx["active_wishes"] = [
         {"title": w.title, "target": w.target_amount, "current": w.current_amount}
         for w in wishes[:5]
