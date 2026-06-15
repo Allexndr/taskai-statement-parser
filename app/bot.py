@@ -555,36 +555,40 @@ async def handle_callback(callback: types.CallbackQuery):
 # ═══ MESSAGE HANDLER (Free text / voice) ═══
 
 async def get_user_context(session, user_id: str) -> dict:
-    """Load full user context from DB for the agent."""
+    """Load full user context from DB for the agent. Run queries in parallel."""
     ctx = {}
 
-    # Finance settings
-    fs = await get_or_create_finance_settings(session, user_id)
+    # Run all independent queries in parallel
+    fs_task = asyncio.create_task(get_or_create_finance_settings(session, user_id))
+    stats_task = asyncio.create_task(get_monthly_stats(session, user_id))
+    tasks_task = asyncio.create_task(get_user_tasks(session, user_id, status="new", limit=20))
+    today_task = asyncio.create_task(get_today_tasks(session, user_id))
+    wishes_task = asyncio.create_task(get_active_wishes(session, user_id))
+
+    fs, stats, tasks, today, wishes = await asyncio.gather(
+        fs_task, stats_task, tasks_task, today_task, wishes_task
+    )
+
     ctx["salary"] = fs.monthly_salary
     ctx["fixed_expenses"] = fs.monthly_expenses
-
-    # Monthly stats
-    stats = await get_monthly_stats(session, user_id)
     ctx["monthly_income"] = stats["income"]
     ctx["monthly_expenses"] = stats["expenses"]
 
-    # Savings
-    savings = await calculate_savings_rate(session, user_id)
-    ctx["savings_potential"] = savings["savings_potential"]
+    # Calculate savings inline — no redundant DB calls
+    salary = fs.monthly_salary or 0
+    fixed_exp = fs.monthly_expenses or 0
+    actual_exp = stats["expenses"]
+    if salary > 0:
+        ctx["savings_potential"] = salary - max(fixed_exp, actual_exp)
+    else:
+        ctx["savings_potential"] = stats["income"] - actual_exp
 
-    # Top expenses (top 3)
+    # Top 3 expenses
     top = dict(sorted(stats["by_category"].items(), key=lambda x: x[1], reverse=True)[:3])
     ctx["top_expenses"] = ", ".join([f"{k}: {v/100:,.0f}₽" for k, v in top.items()]) if top else None
 
-    # Tasks
-    tasks = await get_user_tasks(session, user_id, status="new", limit=20)
     ctx["active_tasks_count"] = len(tasks)
-
-    today = await get_today_tasks(session, user_id)
     ctx["today_tasks"] = [t.title for t in today[:5]] if today else []
-
-    # Wishes
-    wishes = await get_active_wishes(session, user_id)
     ctx["active_wishes"] = [
         {"title": w.title, "target": w.target_amount, "current": w.current_amount}
         for w in wishes[:5]
@@ -596,11 +600,22 @@ async def get_user_context(session, user_id: str) -> dict:
 async def handle_free_text(message: types.Message, text: str):
     async with async_session() as session:
         user = await get_or_create_user(session, message.from_user.id)
-        # Load full context for the thinking agent
-        context = await get_user_context(session, user.id)
+        # Load full context for the thinking agent (with 4s timeout)
+        try:
+            context = await asyncio.wait_for(get_user_context(session, user.id), timeout=4.0)
+        except asyncio.TimeoutError:
+            context = {}
+        except Exception:
+            context = {}
 
-    # Agent thinks with full context
-    parsed = await agent_parse(text, context)
+    # Agent thinks with full context (with 4s timeout)
+    try:
+        parsed = await asyncio.wait_for(agent_parse(text, context), timeout=4.0)
+    except asyncio.TimeoutError:
+        parsed = await asyncio.wait_for(unified_parse(text), timeout=4.0)
+    except Exception:
+        parsed = await unified_parse(text)
+
     msg_type = parsed.get("type", "unknown")
 
     # 0. Question — agent is unsure, asks user
