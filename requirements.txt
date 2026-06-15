@@ -1,0 +1,11 @@
+fastapi==0.111.0
+aiogram==3.7.0
+sqlalchemy==2.0.31
+asyncpg==0.29.0
+alembic==1.13.2
+openai==1.35.3
+pydantic==2.7.4
+pydantic-settings==2.3.4
+python-dotenv==1.0.1
+httpx==0.27.0
+python-telegram-bot==21.3

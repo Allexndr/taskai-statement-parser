@@ -1,0 +1,654 @@
+import os
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.enums import ParseMode
+
+from app.database import async_session
+from app.models import TaskStatus, TaskPriority, TransactionType, Task, Reminder
+from app.tasks_service import get_or_create_user, create_task_from_parsed, get_user_tasks, get_today_tasks
+from app.ai_parser import parse_task_text
+from app.stt import transcribe_voice
+from app.finance_service import (
+    add_transaction, get_monthly_stats, get_or_create_finance_settings,
+    update_finance_settings, calculate_savings_rate, add_wish,
+    add_to_wish, get_active_wishes, calculate_wish_timeline, FINANCE_CATEGORIES
+)
+from app.finance_ai_parser import parse_finance_text, parse_wish_text, parse_finance_settings
+from sqlalchemy import select, update
+
+bot = Bot(token=os.getenv("BOT_TOKEN"))
+dp = Dispatcher()
+
+CONFIDENCE_THRESHOLD = 75
+PAGE_SIZE = 5
+
+
+def fmt_money(amount: int) -> str:
+    return f"{amount/100:,.0f}₽".replace(",", " ")
+
+
+def kb(buttons: list) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def main_menu() -> InlineKeyboardMarkup:
+    return kb([
+        [InlineKeyboardButton(text="📝 Задачи", callback_data="menu:tasks")],
+        [InlineKeyboardButton(text="💰 Финансы", callback_data="menu:finance")],
+        [InlineKeyboardButton(text="🎯 Желания", callback_data="menu:wishes")],
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
+    ])
+
+
+def back_btn(target: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text="← Назад", callback_data=target)
+
+
+def task_emoji(status: str) -> str:
+    return {"new": "🆕", "in_progress": "⏳", "waiting": "⏸️",
+            "done": "✅", "cancelled": "❌"}.get(status, "📝")
+
+
+def prio_emoji(priority: str) -> str:
+    return {"low": "🟢", "medium": "🟡", "high": "🟠", "critical": "🔴"}.get(priority, "⚪")
+
+
+def task_card(task) -> str:
+    due_str = f"\n📅 {task.due_at.strftime('%d.%m %H:%M')}" if task.due_at else ""
+    cat_str = f"\n📂 {task.category}" if task.category else ""
+    shared = "\n👥 Общая" if task.is_shared else "\n🔒 Личная"
+    return f"{task_emoji(task.status)} <b>{task.title}</b>\n{prio_emoji(task.priority)} {task.priority}{due_str}{cat_str}{shared}"
+
+
+async def edit_to_main(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "<b>🤖 Taski — Главное меню</b>\n\nВыбери раздел:",
+        reply_markup=main_menu(), parse_mode=ParseMode.HTML
+    )
+
+
+# ═══ START / MENU ═══
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    async with async_session() as session:
+        await get_or_create_user(session, telegram_id=message.from_user.id,
+            username=message.from_user.username, first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name)
+    await message.answer(
+        "<b>🤖 Taski</b> — твой AI-ассистент\n\n"
+        "• 📝 Задачи с AI-напоминаниями\n"
+        "• 💰 Финансы и накопления\n"
+        "• 🎯 Желания с расчётом срока\n\n"
+        "Просто напиши или скажи голосом что угодно — я пойму!",
+        reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: types.Message):
+    await message.answer("<b>🤖 Taski — Главное меню</b>", reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+
+
+# ═══ TASKS MENU ═══
+
+def tasks_menu_kb() -> InlineKeyboardMarkup:
+    return kb([
+        [InlineKeyboardButton(text="➕ Добавить задачу", callback_data="task:add")],
+        [InlineKeyboardButton(text="📅 На сегодня", callback_data="tasks:today")],
+        [InlineKeyboardButton(text="📋 Все задачи", callback_data="tasks:list:0")],
+        [InlineKeyboardButton(text="📂 По категориям", callback_data="tasks:categories")],
+        [back_btn("menu:main")],
+    ])
+
+
+async def render_task_list(callback: types.CallbackQuery, page: int, status_filter=None):
+    async with async_session() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        tasks = await get_user_tasks(session, user.id, status=status_filter, limit=100)
+
+    if not tasks:
+        await callback.message.edit_text(
+            "📭 Нет задач.\n\nНажми «Добавить задачу» или просто напиши мне.",
+            reply_markup=kb([
+                [InlineKeyboardButton(text="➕ Добавить", callback_data="task:add")],
+                [back_btn("menu:tasks")],
+            ]), parse_mode=ParseMode.HTML)
+        await callback.answer()
+        return
+
+    total = len(tasks)
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_tasks = tasks[start:end]
+    total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+
+    text = f"<b>📋 Задачи</b> (стр. {page+1}/{total_pages})\n\n"
+    buttons = []
+
+    for t in page_tasks:
+        text += f"{task_emoji(t.status)} {t.title[:30]}{'...' if len(t.title)>30 else ''}\n"
+        buttons.append([InlineKeyboardButton(
+            text=f"{'✅' if t.status=='done' else '⏳' if t.status=='in_progress' else '○'} {t.title[:25]}",
+            callback_data=f"task:view:{t.id}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"tasks:list:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+    if end < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"tasks:list:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([back_btn("menu:tasks")])
+
+    await callback.message.edit_text(text, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+async def render_task_detail(callback: types.CallbackQuery, task_id: str):
+    async with async_session() as session:
+        result = await session.execute(select(Task).where(Task.id == task_id))
+        task = result.scalar_one_or_none()
+
+    if not task:
+        await callback.answer("Задача не найдена", show_alert=True)
+        return
+
+    card = task_card(task)
+    buttons = []
+
+    if task.status != TaskStatus.done.value:
+        buttons.append([
+            InlineKeyboardButton(text="✅ Сделано", callback_data=f"task:done:{task.id}"),
+            InlineKeyboardButton(text="⏳ В работу", callback_data=f"task:progress:{task.id}"),
+        ])
+    else:
+        buttons.append([InlineKeyboardButton(text="🔄 Вернуть", callback_data=f"task:reopen:{task.id}")])
+
+    buttons.append([
+        InlineKeyboardButton(text="✏️ Название", callback_data=f"task:edit:{task.id}:title"),
+        InlineKeyboardButton(text="📅 Дедлайн", callback_data=f"task:edit:{task.id}:due"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="🔴 Приоритет", callback_data=f"task:edit:{task.id}:priority"),
+        InlineKeyboardButton(text="📂 Категория", callback_data=f"task:edit:{task.id}:category"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="👥 Общая" if not task.is_shared else "🔒 Личная",
+            callback_data=f"task:toggle_share:{task.id}"),
+        InlineKeyboardButton(text="❌ Удалить", callback_data=f"task:delete:{task.id}"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="🕐 +15м", callback_data=f"task:snooze:{task.id}:15"),
+        InlineKeyboardButton(text="🕐 +1ч", callback_data=f"task:snooze:{task.id}:60"),
+        InlineKeyboardButton(text="📅 Завтра", callback_data=f"task:snooze:{task.id}:1440"),
+    ])
+    buttons.append([back_btn("tasks:list:0")])
+
+    await callback.message.edit_text(
+        f"{card}\n\n<i>Нажми кнопку для действия</i>",
+        reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+# ═══ FINANCE MENU ═══
+
+def finance_menu_kb() -> InlineKeyboardMarkup:
+    return kb([
+        [InlineKeyboardButton(text="📊 Баланс", callback_data="finance:balance")],
+        [InlineKeyboardButton(text="➕ Доход", callback_data="finance:add_income")],
+        [InlineKeyboardButton(text="➖ Расход", callback_data="finance:add_expense")],
+        [InlineKeyboardButton(text="📋 История", callback_data="finance:list:0")],
+        [InlineKeyboardButton(text="⚙️ Зарплата", callback_data="finance:settings")],
+        [back_btn("menu:main")],
+    ])
+
+
+async def render_finance_balance(callback: types.CallbackQuery):
+    async with async_session() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        stats = await get_monthly_stats(session, user.id)
+        settings = await get_or_create_finance_settings(session, user.id)
+        savings = await calculate_savings_rate(session, user.id)
+
+    text = (
+        f"<b>💰 Финансы за месяц</b>\n\n"
+        f"➕ Доход: {fmt_money(stats['income'])}\n"
+        f"➖ Расходы: {fmt_money(stats['expenses'])}\n"
+        f"📊 Баланс: {fmt_money(stats['balance'])}\n\n"
+    )
+    if settings.monthly_salary:
+        text += (
+            f"<b>📈 Накопления</b>\n"
+            f"Зарплата: {fmt_money(settings.monthly_salary)}\n"
+            f"Расходы: {fmt_money(settings.monthly_expenses or 0)}\n"
+            f"Потенциал: {fmt_money(savings['savings_potential'])}\n"
+            f"Ставка: {savings['savings_rate']}%\n\n"
+        )
+    if stats['by_category']:
+        text += "<b>📂 Топ категории:</b>\n"
+        for cat, amt in list(stats['by_category'].items())[:5]:
+            text += f"  {cat}: {fmt_money(amt)}\n"
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=kb([
+            [InlineKeyboardButton(text="➕ Доход", callback_data="finance:add_income")],
+            [InlineKeyboardButton(text="➖ Расход", callback_data="finance:add_expense")],
+            [back_btn("menu:finance")],
+        ]), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+# ═══ WISHES MENU ═══
+
+def wishes_menu_kb() -> InlineKeyboardMarkup:
+    return kb([
+        [InlineKeyboardButton(text="➕ Добавить желание", callback_data="wish:add")],
+        [InlineKeyboardButton(text="🎯 Мои желания", callback_data="wishes:list:0")],
+        [back_btn("menu:main")],
+    ])
+
+
+async def render_wish_list(callback: types.CallbackQuery, page: int = 0):
+    async with async_session() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        wishes = await get_active_wishes(session, user.id)
+
+    if not wishes:
+        await callback.message.edit_text(
+            "🎯 Пока нет желаний.\n\nПросто напиши: «Хочу MacBook за 200000»",
+            reply_markup=kb([
+                [InlineKeyboardButton(text="➕ Добавить", callback_data="wish:add")],
+                [back_btn("menu:wishes")],
+            ]), parse_mode=ParseMode.HTML)
+        await callback.answer()
+        return
+
+    total = len(wishes)
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_items = wishes[start:end]
+    total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+
+    text = f"<b>🎯 Желания</b> (стр. {page+1}/{total_pages})\n\n"
+    buttons = []
+
+    for w in page_items:
+        pct = (w.current_amount / w.target_amount * 100) if w.target_amount else 0
+        bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+        text += f"{bar} {pct:.0f}% {w.title[:20]}\n"
+        buttons.append([InlineKeyboardButton(
+            text=f"{w.title[:28]}{'...' if len(w.title)>28 else ''} — {fmt_money(w.current_amount)}/{fmt_money(w.target_amount)}",
+            callback_data=f"wish:view:{w.id}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"wishes:list:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+    if end < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"wishes:list:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([back_btn("menu:wishes")])
+
+    await callback.message.edit_text(text, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+async def render_wish_detail(callback: types.CallbackQuery, wish_id: str):
+    async with async_session() as session:
+        from app.models import Wish
+        result = await session.execute(select(Wish).where(Wish.id == wish_id))
+        wish = result.scalar_one_or_none()
+        timeline = None
+        if wish:
+            timeline = await calculate_wish_timeline(session, wish.user_id, wish)
+
+    if not wish:
+        await callback.answer("Желание не найдено", show_alert=True)
+        return
+
+    pct = (wish.current_amount / wish.target_amount * 100) if wish.target_amount else 0
+    bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+    text = (
+        f"<b>🎯 {wish.title}</b>\n\n"
+        f"[{bar}] {pct:.1f}%\n"
+        f"💰 {fmt_money(wish.current_amount)} / {fmt_money(wish.target_amount)}\n"
+        f"📂 {wish.category or 'Другое'}\n"
+    )
+    if timeline and timeline.get("months") is not None:
+        text += f"⏱ ~{timeline['months']} мес до цели\n"
+        text += f"📅 {timeline.get('completion_date', '')}\n"
+
+    buttons = [
+        [InlineKeyboardButton(text="💰 +1000₽", callback_data=f"wish:save:{wish.id}:100000")],
+        [InlineKeyboardButton(text="💰 +5000₽", callback_data=f"wish:save:{wish.id}:500000")],
+        [InlineKeyboardButton(text="💰 +10000₽", callback_data=f"wish:save:{wish.id}:1000000")],
+        [InlineKeyboardButton(text="❌ Удалить", callback_data=f"wish:delete:{wish.id}")],
+        [back_btn("wishes:list:0")],
+    ]
+    await callback.message.edit_text(text, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+# ═══ CALLBACK ROUTER ═══
+
+@dp.callback_query()
+async def handle_callback(callback: types.CallbackQuery):
+    data = callback.data
+    parts = data.split(":")
+    action = parts[0]
+
+    try:
+        if data == "noop":
+            await callback.answer()
+            return
+
+        if data == "menu:main":
+            await edit_to_main(callback)
+            return
+
+        if data == "menu:tasks":
+            await callback.message.edit_text(
+                "<b>📝 Задачи</b>\n\nЧто делаем?",
+                reply_markup=tasks_menu_kb(), parse_mode=ParseMode.HTML)
+            await callback.answer()
+            return
+
+        if data == "tasks:today":
+            async with async_session() as session:
+                user = await get_or_create_user(session, callback.from_user.id)
+                tasks = await get_today_tasks(session, user.id)
+            if not tasks:
+                text = "🎉 На сегодня нет задач!"
+            else:
+                text = "<b>📅 Задачи на сегодня:</b>\n\n"
+                for t in tasks:
+                    text += f"{task_emoji(t.status)} {t.title}\n"
+            await callback.message.edit_text(text, reply_markup=kb([
+                [InlineKeyboardButton(text="📋 Все задачи", callback_data="tasks:list:0")],
+                [back_btn("menu:tasks")],
+            ]), parse_mode=ParseMode.HTML)
+            await callback.answer()
+            return
+
+        if data == "tasks:categories":
+            cats = ["Работа","Дом","Финансы","Здоровье","Учёба","Покупки","Отношения","Хобби","Другое"]
+            btns = [[InlineKeyboardButton(text=cat, callback_data=f"tasks:cat:{cat}:0")] for cat in cats]
+            btns.append([back_btn("menu:tasks")])
+            await callback.message.edit_text("<b>📂 Выбери категорию:</b>", reply_markup=kb(btns), parse_mode=ParseMode.HTML)
+            await callback.answer()
+            return
+
+        if action == "tasks" and parts[1] == "list":
+            page = int(parts[2]) if len(parts) > 2 else 0
+            await render_task_list(callback, page)
+            return
+
+        if action == "task" and parts[1] == "view":
+            await render_task_detail(callback, parts[2])
+            return
+
+        if action == "task" and parts[1] == "done":
+            async with async_session() as session:
+                await session.execute(update(Task).where(Task.id == parts[2]).values(
+                    status=TaskStatus.done, completed_at=datetime.utcnow()))
+                await session.commit()
+            await callback.answer("✅ Выполнено!")
+            await render_task_detail(callback, parts[2])
+            return
+
+        if action == "task" and parts[1] == "progress":
+            async with async_session() as session:
+                await session.execute(update(Task).where(Task.id == parts[2]).values(status=TaskStatus.in_progress))
+                await session.commit()
+            await callback.answer("⏳ В работе")
+            await render_task_detail(callback, parts[2])
+            return
+
+        if action == "task" and parts[1] == "reopen":
+            async with async_session() as session:
+                await session.execute(update(Task).where(Task.id == parts[2]).values(status=TaskStatus.new, completed_at=None))
+                await session.commit()
+            await callback.answer("🔄 Вернуто")
+            await render_task_detail(callback, parts[2])
+            return
+
+        if action == "task" and parts[1] == "delete":
+            async with async_session() as session:
+                await session.execute(update(Task).where(Task.id == parts[2]).values(status=TaskStatus.cancelled))
+                await session.commit()
+            await callback.answer("❌ Удалено")
+            await render_task_list(callback, 0)
+            return
+
+        if action == "task" and parts[1] == "toggle_share":
+            async with async_session() as session:
+                result = await session.execute(select(Task).where(Task.id == parts[2]))
+                t = result.scalar_one_or_none()
+                if t:
+                    new_shared = not t.is_shared
+                    await session.execute(update(Task).where(Task.id == parts[2]).values(
+                        is_shared=new_shared, is_visible_to_partner=new_shared))
+                    await session.commit()
+            await callback.answer("👥 Обновлено")
+            await render_task_detail(callback, parts[2])
+            return
+
+        if action == "task" and parts[1] == "snooze":
+            minutes = int(parts[3])
+            async with async_session() as session:
+                result = await session.execute(select(Task).where(Task.id == parts[2]))
+                task = result.scalar_one_or_none()
+                if task:
+                    r = Reminder(task_id=task.id, user_id=task.owner_id,
+                        remind_at=datetime.utcnow() + timedelta(minutes=minutes), status="pending")
+                    session.add(r)
+                    await session.commit()
+            await callback.answer(f"⏰ +{minutes} мин")
+            await render_task_detail(callback, parts[2])
+            return
+
+        if data == "task:add":
+            await callback.message.edit_text(
+                "📝 <b>Добавить задачу</b>\n\nПросто напиши, например:\n<code>Завтра в 10 созвон с клиентом !важно</code>",
+                reply_markup=kb([[back_btn("menu:tasks")]]), parse_mode=ParseMode.HTML)
+            await callback.answer()
+            return
+
+        # ── FINANCE ──
+        if data == "menu:finance":
+            await callback.message.edit_text(
+                "<b>💰 Финансы</b>\n\nЧто делаем?",
+                reply_markup=finance_menu_kb(), parse_mode=ParseMode.HTML)
+            await callback.answer()
+            return
+
+        if data == "finance:balance":
+            await render_finance_balance(callback)
+            return
+
+        if data == "finance:add_income":
+            await callback.message.edit_text(
+                "💵 <b>Запись дохода</b>\n\nНапиши, например:\n<code>Получил зарплату 150000</code>",
+                reply_markup=kb([[back_btn("menu:finance")]]), parse_mode=ParseMode.HTML)
+            await callback.answer()
+            return
+
+        if data == "finance:add_expense":
+            await callback.message.edit_text(
+                "💸 <b>Запись расхода</b>\n\nНапиши, например:\n<code>Потратил 500 на кофе</code>",
+                reply_markup=kb([[back_btn("menu:finance")]]), parse_mode=ParseMode.HTML)
+            await callback.answer()
+            return
+
+        if data == "finance:settings":
+            await callback.message.edit_text(
+                "💰 <b>Настройки зарплаты</b>\n\nНапиши, например:\n<code>ЗП 150000, расходы 80000</code>",
+                reply_markup=kb([[back_btn("menu:finance")]]), parse_mode=ParseMode.HTML)
+            await callback.answer()
+            return
+
+        # ── WISHES ──
+        if data == "menu:wishes":
+            await callback.message.edit_text(
+                "<b>🎯 Желания</b>\n\nЧто делаем?",
+                reply_markup=wishes_menu_kb(), parse_mode=ParseMode.HTML)
+            await callback.answer()
+            return
+
+        if data == "wish:add":
+            await callback.message.edit_text(
+                "🎯 <b>Добавить желание</b>\n\nНапиши, например:\n<code>Хочу MacBook за 200000</code>",
+                reply_markup=kb([[back_btn("menu:wishes")]]), parse_mode=ParseMode.HTML)
+            await callback.answer()
+            return
+
+        if action == "wishes" and parts[1] == "list":
+            page = int(parts[2]) if len(parts) > 2 else 0
+            await render_wish_list(callback, page)
+            return
+
+        if action == "wish" and parts[1] == "view":
+            await render_wish_detail(callback, parts[2])
+            return
+
+        if action == "wish" and parts[1] == "save":
+            amount = int(parts[3])
+            async with async_session() as session:
+                w = await add_to_wish(session, parts[2], amount)
+            if w and w.status == "achieved":
+                await callback.answer("🎉 Цель достигнута!", show_alert=True)
+            else:
+                await callback.answer(f"💰 +{fmt_money(amount)}")
+            await render_wish_detail(callback, parts[2])
+            return
+
+        if action == "wish" and parts[1] == "delete":
+            async with async_session() as session:
+                from app.models import Wish
+                await session.execute(update(Wish).where(Wish.id == parts[2]).values(status="cancelled"))
+                await session.commit()
+            await callback.answer("❌ Удалено")
+            await render_wish_list(callback, 0)
+            return
+
+        # ── SETTINGS ──
+        if data == "menu:settings":
+            await callback.message.edit_text("<b>⚙️ Настройки</b>", reply_markup=kb([
+                [InlineKeyboardButton(text="👥 Добавить девушку", callback_data="settings:partner")],
+                [InlineKeyboardButton(text="💰 Зарплата", callback_data="finance:settings")],
+                [back_btn("menu:main")],
+            ]), parse_mode=ParseMode.HTML)
+            await callback.answer()
+            return
+
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"Ошибка: {str(e)[:50]}", show_alert=True)
+
+
+# ═══ MESSAGE HANDLER (Free text / voice) ═══
+
+async def handle_free_text(message: types.Message, text: str):
+    # 1. Finance settings
+    settings = await parse_finance_settings(text)
+    if settings.get("monthly_salary") or settings.get("monthly_expenses"):
+        async with async_session() as session:
+            user = await get_or_create_user(session, message.from_user.id)
+            fs = await update_finance_settings(
+                session, user.id,
+                monthly_salary=settings.get("monthly_salary") * 100 if settings.get("monthly_salary") else None,
+                monthly_expenses=settings.get("monthly_expenses") * 100 if settings.get("monthly_expenses") else None)
+        msg = "✅ <b>Настройки сохранены!</b>\n\n"
+        if fs.monthly_salary:
+            msg += f"Зарплата: {fmt_money(fs.monthly_salary)}\n"
+        if fs.monthly_expenses:
+            msg += f"Расходы: {fmt_money(fs.monthly_expenses)}"
+        await message.answer(msg, reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+        return
+
+    # 2. Finance transaction
+    finance = await parse_finance_text(text)
+    if finance.get("is_finance") and finance.get("confidence", 0) > 60:
+        async with async_session() as session:
+            user = await get_or_create_user(session, message.from_user.id)
+            await add_transaction(
+                session, user.id, amount=finance["amount"] * 100,
+                type_=TransactionType.income if finance["type"] == "income" else TransactionType.expense,
+                category=finance["category"], description=finance.get("description", text[:200]))
+        emoji = "➕" if finance["type"] == "income" else "➖"
+        sign = "Доход" if finance["type"] == "income" else "Расход"
+        await message.answer(
+            f"{emoji} <b>{sign} записан!</b>\n\nСумма: {finance['amount']:,.0f}₽\nКатегория: {finance['category']}",
+            reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+        return
+
+    # 3. Wish
+    wish = await parse_wish_text(text)
+    if wish.get("is_wish") and wish.get("target_amount", 0) > 0:
+        async with async_session() as session:
+            user = await get_or_create_user(session, message.from_user.id)
+            w = await add_wish(
+                session, user.id, title=wish["title"], target_amount=wish["target_amount"] * 100,
+                priority=wish.get("priority", "medium"), category=wish.get("category"),
+                deadline=datetime.strptime(wish["deadline"], "%Y-%m-%d") if wish.get("deadline") else None)
+            timeline = await calculate_wish_timeline(session, user.id, w)
+        extra = ""
+        if timeline.get("months") is not None:
+            extra = f"\n⏱ ~{timeline['months']} мес до цели"
+        await message.answer(
+            f"🎯 <b>Желание добавлено!</b>\n\n<b>{w.title}</b>\n💰 Цель: {w.target_amount/100:,.0f}₽\n📂 {w.category or 'Другое'}{extra}",
+            reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+        return
+
+    # 4. Task
+    parsed = await parse_task_text(text)
+    if not parsed.get("is_task"):
+        await message.answer(
+            "🤔 Это задача или заметка?\n\nНапиши по-другому или выбери раздел в меню.",
+            reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+        return
+
+    conf_cat = parsed.get("confidence_category", 0)
+    if conf_cat < CONFIDENCE_THRESHOLD:
+        cats = ["Работа","Дом","Финансы","Здоровье","Учёба","Покупки","Отношения","Хобби","Другое"]
+        cat_buttons = [[InlineKeyboardButton(
+            text=f"{cat} {'✅' if cat == parsed.get('category') else ''}",
+            callback_data=f"confirm_cat:{cat}:{text[:80]}")]
+            for cat in cats]
+        await message.answer(
+            f"🤔 Кажется, это категория <b>{parsed.get('category', 'Другое')}</b> ({conf_cat}%).\nВерно?",
+            reply_markup=kb(cat_buttons), parse_mode=ParseMode.HTML)
+        return
+
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        task = await create_task_from_parsed(session, user.id, parsed)
+    card = task_card(task)
+    await message.answer(
+        f"✅ <b>Задача создана!</b>\n\n{card}",
+        reply_markup=kb([
+            [InlineKeyboardButton(text="📋 Мои задачи", callback_data="tasks:list:0")],
+            [InlineKeyboardButton(text="📊 Главное меню", callback_data="menu:main")],
+        ]), parse_mode=ParseMode.HTML)
+
+
+@dp.message()
+async def handle_message(message: types.Message):
+    if message.voice or message.audio:
+        await message.answer("🎤 Распознаю голос...")
+        file = await bot.get_file(message.voice.file_id if message.voice else message.audio.file_id)
+        file_url = f"https://api.telegram.org/file/bot{os.getenv('BOT_TOKEN')}/{file.file_path}"
+        transcript = await transcribe_voice(file_url)
+        if transcript.startswith("[Ошибка"):
+            await message.answer(transcript, reply_markup=main_menu())
+            return
+        await message.answer(f"📝 <b>Распознано:</b>\n<i>{transcript[:400]}</i>", parse_mode=ParseMode.HTML)
+        await handle_free_text(message, transcript)
+    elif message.text and not message.text.startswith('/'):
+        await handle_free_text(message, message.text)
+

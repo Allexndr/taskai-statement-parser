@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+.env
+.venv
+venv/
+env/
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
+alembic/versions/*.pyc
+.vercel
