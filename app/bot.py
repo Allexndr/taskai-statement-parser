@@ -1,4 +1,5 @@
 import os
+import asyncio
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -554,8 +555,17 @@ async def handle_callback(callback: types.CallbackQuery):
 # ═══ MESSAGE HANDLER (Free text / voice) ═══
 
 async def handle_free_text(message: types.Message, text: str):
-    # 1. Finance settings
-    settings = await parse_finance_settings(text)
+    # Run all AI parsers in parallel to fit Vercel 10s timeout
+    settings_task = asyncio.create_task(parse_finance_settings(text))
+    finance_task = asyncio.create_task(parse_finance_text(text))
+    wish_task = asyncio.create_task(parse_wish_text(text))
+    task_task = asyncio.create_task(parse_task_text(text))
+
+    settings, finance, wish, parsed = await asyncio.gather(
+        settings_task, finance_task, wish_task, task_task
+    )
+
+    # 1. Finance settings (highest priority)
     if settings.get("monthly_salary") or settings.get("monthly_expenses"):
         async with async_session() as session:
             user = await get_or_create_user(session, message.from_user.id)
@@ -572,7 +582,6 @@ async def handle_free_text(message: types.Message, text: str):
         return
 
     # 2. Finance transaction
-    finance = await parse_finance_text(text)
     if finance.get("is_finance") and finance.get("confidence", 0) > 60:
         async with async_session() as session:
             user = await get_or_create_user(session, message.from_user.id)
@@ -588,7 +597,6 @@ async def handle_free_text(message: types.Message, text: str):
         return
 
     # 3. Wish
-    wish = await parse_wish_text(text)
     if wish.get("is_wish") and wish.get("target_amount", 0) > 0:
         async with async_session() as session:
             user = await get_or_create_user(session, message.from_user.id)
@@ -606,7 +614,6 @@ async def handle_free_text(message: types.Message, text: str):
         return
 
     # 4. Task
-    parsed = await parse_task_text(text)
     if not parsed.get("is_task"):
         await message.answer(
             "🤔 Это задача или заметка?\n\nНапиши по-другому или выбери раздел в меню.",
