@@ -16,6 +16,7 @@ async def init_db():
     if _db_initialized:
         return
     from app.database import engine, Base
+    import app.models  # noqa: F401 — registers tables in Base.metadata
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     _db_initialized = True
