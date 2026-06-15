@@ -240,3 +240,177 @@ async def unified_parse(text: str) -> dict:
             "confidence_priority": 30,
             "confidence": 30,
         }
+
+
+AGENT_PROMPT = """Ты — личный AI-агент Taski. У тебя есть полный контекст данных пользователя.
+Твоя задача — понять намерение пользователя, проанализировать контекст и принять решение.
+
+Данные пользователя (текущие):
+{context}
+
+Текущая дата: {today}
+
+Возможные действия:
+- "create_task" — создать задачу
+- "create_transaction" — записать доход/расход
+- "update_settings" — обновить зарплату/расходы
+- "create_wish" — добавить желание/цель
+- "ask_question" — переспросить пользователя для уточнения
+- "answer" — просто ответить на вопрос (анализ бюджета, совет, расчёт)
+- "unknown" — не понял, что делать
+
+Рассуждай шаг за шагом:
+1. Что хочет пользователь?
+2. Какие данные из контекста релевантны?
+3. Есть ли неоднозначность? Если да — задай уточняющий вопрос.
+4. Какое действие выполнить?
+
+Ответ СТРОГО в JSON:
+{{
+  "action": "create_task|create_transaction|update_settings|create_wish|ask_question|answer|unknown",
+  "confidence": число 0-100,
+  "reasoning": "краткое рассуждение",
+  "data": {{
+    // для create_task:
+    "title": "...", "description": "...", "category": "...", "priority": "...", "due_at": "..." или null,
+    // для create_transaction:
+    "type": "income|expense", "amount": число, "category": "...", "description": "...",
+    // для update_settings:
+    "monthly_salary": число или null, "monthly_expenses": число или null,
+    // для create_wish:
+    "title": "...", "target_amount": число, "category": "...", "priority": "...", "deadline": "YYYY-MM-DD" или null,
+    // для ask_question:
+    "question": "текст вопроса",
+    // для answer:
+    "text": "текст ответа"
+  }}
+}}
+
+Критические правила контекста:
+- "зарплата", "доход", "расходы", "трачу", "бюджет" → finance (settings или transaction)
+- "В кселл зарплата 370.000" → update_settings, monthly_salary: 370000
+- "проверить цены в кселл" → create_task
+- "сколько откладывать" → answer, используй savings_potential из контекста
+- "когда накоплю на..." → answer, используй wish timeline из контекста
+- Если не уверен (>70%%) — спроси, а не гадай.
+"""
+
+
+async def agent_parse(text: str, context: dict) -> dict:
+    """Thinking agent with full user context."""
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Build context string
+    ctx_lines = []
+    if context.get("salary"):
+        ctx_lines.append(f"- Зарплата: {context['salary']:,}₽/мес")
+    if context.get("fixed_expenses"):
+        ctx_lines.append(f"- Фиксированные расходы: {context['fixed_expenses']:,}₽/мес")
+    if context.get("monthly_income") is not None:
+        ctx_lines.append(f"- Доход за текущий месяц: {context['monthly_income']:,}₽")
+    if context.get("monthly_expenses") is not None:
+        ctx_lines.append(f"- Траты за текущий месяц: {context['monthly_expenses']:,}₽")
+    if context.get("savings_potential") is not None:
+        ctx_lines.append(f"- Свободно для накоплений: {context['savings_potential']:,}₽/мес")
+    if context.get("top_expenses"):
+        ctx_lines.append(f"- Топ трат: {context['top_expenses']}")
+    if context.get("active_tasks_count") is not None:
+        ctx_lines.append(f"- Активных задач: {context['active_tasks_count']}")
+    if context.get("today_tasks"):
+        ctx_lines.append(f"- Задачи на сегодня: {', '.join(context['today_tasks'])}")
+    if context.get("active_wishes"):
+        wishes = ", ".join([f"{w['title']} ({w['target']:,}₽)" for w in context["active_wishes"]])
+        ctx_lines.append(f"- Желания: {wishes}")
+
+    context_str = "\n".join(ctx_lines) if ctx_lines else "(данных пока нет — пользователь новый)"
+
+    messages = [
+        {"role": "system", "content": AGENT_PROMPT.format(context=context_str, today=today)},
+        {"role": "user", "content": text}
+    ]
+
+    try:
+        response = await client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            temperature=0.2,
+            max_tokens=600
+        )
+        result = json.loads(response.choices[0].message.content)
+
+        action = result.get("action", "unknown")
+        data = result.get("data", {})
+
+        # Normalize to unified format
+        if action == "update_settings":
+            return {
+                "type": "finance_settings",
+                "monthly_salary": data.get("monthly_salary"),
+                "monthly_expenses": data.get("monthly_expenses"),
+                "reasoning": result.get("reasoning", ""),
+            }
+
+        if action == "create_transaction":
+            return {
+                "type": "finance_transaction",
+                "is_finance": True,
+                "type_tx": data.get("type", "expense"),
+                "amount": data.get("amount", 0),
+                "category": data.get("category", "Другое"),
+                "description": data.get("description", text[:200]),
+                "confidence": result.get("confidence", 80),
+                "reasoning": result.get("reasoning", ""),
+            }
+
+        if action == "create_wish":
+            return {
+                "type": "wish",
+                "is_wish": True,
+                "title": data.get("title", text[:100]),
+                "target_amount": data.get("target_amount", 0),
+                "category": data.get("category"),
+                "priority": data.get("priority", "medium"),
+                "deadline": data.get("deadline"),
+                "confidence": result.get("confidence", 80),
+                "reasoning": result.get("reasoning", ""),
+            }
+
+        if action == "create_task":
+            due = data.get("due_at")
+            if due:
+                try:
+                    datetime.fromisoformat(due.replace('Z', '+00:00'))
+                except ValueError:
+                    due = None
+            return {
+                "type": "task",
+                "is_task": True,
+                "title": data.get("title", text[:100]),
+                "description": data.get("description"),
+                "category": data.get("category", "Другое"),
+                "priority": data.get("priority", "medium"),
+                "due_at": due,
+                "confidence_category": data.get("confidence_category", 50),
+                "confidence_priority": data.get("confidence_priority", 50),
+                "confidence": result.get("confidence", 80),
+                "reasoning": result.get("reasoning", ""),
+            }
+
+        if action == "ask_question":
+            return {
+                "type": "question",
+                "question": data.get("question", "Можешь уточнить?"),
+                "reasoning": result.get("reasoning", ""),
+            }
+
+        if action == "answer":
+            return {
+                "type": "answer",
+                "text": data.get("text", "Не могу ответить на это прямо сейчас."),
+                "reasoning": result.get("reasoning", ""),
+            }
+
+        return {"type": "unknown"}
+
+    except Exception as e:
+        return {"type": "unknown"}

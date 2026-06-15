@@ -9,7 +9,7 @@ from aiogram.enums import ParseMode
 from app.database import async_session
 from app.models import TaskStatus, TaskPriority, TransactionType, Task, Reminder
 from app.tasks_service import get_or_create_user, create_task_from_parsed, get_user_tasks, get_today_tasks
-from app.ai_parser import parse_task_text, unified_parse
+from app.ai_parser import parse_task_text, unified_parse, agent_parse
 from app.stt import transcribe_voice
 from app.finance_service import (
     add_transaction, get_monthly_stats, get_or_create_finance_settings,
@@ -554,10 +554,68 @@ async def handle_callback(callback: types.CallbackQuery):
 
 # ═══ MESSAGE HANDLER (Free text / voice) ═══
 
+async def get_user_context(session, user_id: str) -> dict:
+    """Load full user context from DB for the agent."""
+    ctx = {}
+
+    # Finance settings
+    fs = await get_or_create_finance_settings(session, user_id)
+    ctx["salary"] = fs.monthly_salary
+    ctx["fixed_expenses"] = fs.monthly_expenses
+
+    # Monthly stats
+    stats = await get_monthly_stats(session, user_id)
+    ctx["monthly_income"] = stats["income"]
+    ctx["monthly_expenses"] = stats["expenses"]
+
+    # Savings
+    savings = await calculate_savings_rate(session, user_id)
+    ctx["savings_potential"] = savings["savings_potential"]
+
+    # Top expenses (top 3)
+    top = dict(sorted(stats["by_category"].items(), key=lambda x: x[1], reverse=True)[:3])
+    ctx["top_expenses"] = ", ".join([f"{k}: {v/100:,.0f}₽" for k, v in top.items()]) if top else None
+
+    # Tasks
+    tasks = await get_user_tasks(session, user_id, status="new", limit=20)
+    ctx["active_tasks_count"] = len(tasks)
+
+    today = await get_today_tasks(session, user_id)
+    ctx["today_tasks"] = [t.title for t in today[:5]] if today else []
+
+    # Wishes
+    wishes = await get_active_wishes(session, user_id)
+    ctx["active_wishes"] = [
+        {"title": w.title, "target": w.target_amount, "current": w.current_amount}
+        for w in wishes[:5]
+    ] if wishes else []
+
+    return ctx
+
+
 async def handle_free_text(message: types.Message, text: str):
-    # Single-call context-aware parser
-    parsed = await unified_parse(text)
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        # Load full context for the thinking agent
+        context = await get_user_context(session, user.id)
+
+    # Agent thinks with full context
+    parsed = await agent_parse(text, context)
     msg_type = parsed.get("type", "unknown")
+
+    # 0. Question — agent is unsure, asks user
+    if msg_type == "question":
+        await message.answer(
+            f"🤔 <b>{parsed['question']}</b>",
+            reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+        return
+
+    # 0.5. Answer — agent responds with analysis
+    if msg_type == "answer":
+        await message.answer(
+            f"💡 {parsed['text']}",
+            reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+        return
 
     # 1. Finance settings
     if msg_type == "finance_settings":
