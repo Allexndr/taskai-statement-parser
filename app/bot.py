@@ -9,7 +9,7 @@ from aiogram.enums import ParseMode
 from app.database import async_session
 from app.models import TaskStatus, TaskPriority, TransactionType, Task, Reminder
 from app.tasks_service import get_or_create_user, create_task_from_parsed, get_user_tasks, get_today_tasks
-from app.ai_parser import parse_task_text
+from app.ai_parser import parse_task_text, unified_parse
 from app.stt import transcribe_voice
 from app.finance_service import (
     add_transaction, get_monthly_stats, get_or_create_finance_settings,
@@ -555,24 +555,18 @@ async def handle_callback(callback: types.CallbackQuery):
 # ═══ MESSAGE HANDLER (Free text / voice) ═══
 
 async def handle_free_text(message: types.Message, text: str):
-    # DEBUG: run all AI parsers in parallel
-    settings_task = asyncio.create_task(parse_finance_settings(text))
-    finance_task = asyncio.create_task(parse_finance_text(text))
-    wish_task = asyncio.create_task(parse_wish_text(text))
-    task_task = asyncio.create_task(parse_task_text(text))
+    # Single-call context-aware parser
+    parsed = await unified_parse(text)
+    msg_type = parsed.get("type", "unknown")
 
-    settings, finance, wish, parsed = await asyncio.gather(
-        settings_task, finance_task, wish_task, task_task
-    )
-
-    # 1. Finance settings (highest priority)
-    if settings.get("monthly_salary") or settings.get("monthly_expenses"):
+    # 1. Finance settings
+    if msg_type == "finance_settings":
         async with async_session() as session:
             user = await get_or_create_user(session, message.from_user.id)
             fs = await update_finance_settings(
                 session, user.id,
-                monthly_salary=settings.get("monthly_salary") * 100 if settings.get("monthly_salary") else None,
-                monthly_expenses=settings.get("monthly_expenses") * 100 if settings.get("monthly_expenses") else None)
+                monthly_salary=parsed.get("monthly_salary") * 100 if parsed.get("monthly_salary") else None,
+                monthly_expenses=parsed.get("monthly_expenses") * 100 if parsed.get("monthly_expenses") else None)
         msg = "✅ <b>Настройки сохранены!</b>\n\n"
         if fs.monthly_salary:
             msg += f"Зарплата: {fmt_money(fs.monthly_salary)}\n"
@@ -582,28 +576,28 @@ async def handle_free_text(message: types.Message, text: str):
         return
 
     # 2. Finance transaction
-    if finance.get("is_finance") and finance.get("confidence", 0) > 60:
+    if msg_type == "finance_transaction":
         async with async_session() as session:
             user = await get_or_create_user(session, message.from_user.id)
             await add_transaction(
-                session, user.id, amount=finance["amount"] * 100,
-                type_=TransactionType.income if finance["type"] == "income" else TransactionType.expense,
-                category=finance["category"], description=finance.get("description", text[:200]))
-        emoji = "➕" if finance["type"] == "income" else "➖"
-        sign = "Доход" if finance["type"] == "income" else "Расход"
+                session, user.id, amount=parsed["amount"] * 100,
+                type_=TransactionType.income if parsed["type_tx"] == "income" else TransactionType.expense,
+                category=parsed["category"], description=parsed.get("description", text[:200]))
+        emoji = "➕" if parsed["type_tx"] == "income" else "➖"
+        sign = "Доход" if parsed["type_tx"] == "income" else "Расход"
         await message.answer(
-            f"{emoji} <b>{sign} записан!</b>\n\nСумма: {finance['amount']:,.0f}₽\nКатегория: {finance['category']}",
+            f"{emoji} <b>{sign} записан!</b>\n\nСумма: {parsed['amount']:,.0f}₽\nКатегория: {parsed['category']}",
             reply_markup=main_menu(), parse_mode=ParseMode.HTML)
         return
 
     # 3. Wish
-    if wish.get("is_wish") and wish.get("target_amount", 0) > 0:
+    if msg_type == "wish":
         async with async_session() as session:
             user = await get_or_create_user(session, message.from_user.id)
             w = await add_wish(
-                session, user.id, title=wish["title"], target_amount=wish["target_amount"] * 100,
-                priority=wish.get("priority", "medium"), category=wish.get("category"),
-                deadline=datetime.strptime(wish["deadline"], "%Y-%m-%d") if wish.get("deadline") else None)
+                session, user.id, title=parsed["title"], target_amount=parsed["target_amount"] * 100,
+                priority=parsed.get("priority", "medium"), category=parsed.get("category"),
+                deadline=datetime.strptime(parsed["deadline"], "%Y-%m-%d") if parsed.get("deadline") else None)
             timeline = await calculate_wish_timeline(session, user.id, w)
         extra = ""
         if timeline.get("months") is not None:
@@ -614,7 +608,7 @@ async def handle_free_text(message: types.Message, text: str):
         return
 
     # 4. Task
-    if not parsed.get("is_task"):
+    if msg_type != "task" or not parsed.get("is_task"):
         await message.answer(
             "🤔 Это задача или заметка?\n\nНапиши по-другому или выбери раздел в меню.",
             reply_markup=main_menu(), parse_mode=ParseMode.HTML)
