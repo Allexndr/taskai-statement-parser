@@ -5,7 +5,7 @@ from openai import AsyncOpenAI
 
 client = AsyncOpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
-    base_url="https://api.together.xyz/v1"
+    base_url="https://api.groq.com/openai/v1"
 )
 
 PARSE_PROMPT = """Ты — персональный AI-ассистент для управления задачами пользователя. 
@@ -55,7 +55,7 @@ async def parse_task_text(text: str, user_context: dict = None) -> dict:
     
     try:
         response = await client.chat.completions.create(
-            model="meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+            model="llama-3.1-8b-instant",
             messages=messages,
             temperature=0.3,
             max_tokens=400

@@ -5,7 +5,7 @@ from openai import AsyncOpenAI
 
 client = AsyncOpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
-    base_url="https://api.together.xyz/v1"
+    base_url="https://api.groq.com/openai/v1"
 )
 
 FINANCE_PROMPT = """Ты — персональный AI-финансовый ассистент. 
@@ -34,7 +34,7 @@ FINANCE_PROMPT = """Ты — персональный AI-финансовый а
 async def parse_finance_text(text: str) -> dict:
     try:
         response = await client.chat.completions.create(
-            model="meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": FINANCE_PROMPT},
                 {"role": "user", "content": text}
@@ -79,7 +79,7 @@ async def parse_wish_text(text: str) -> dict:
 """
     try:
         response = await client.chat.completions.create(
-            model="meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": text}
@@ -106,7 +106,7 @@ async def parse_finance_settings(text: str) -> dict:
 """
     try:
         response = await client.chat.completions.create(
-            model="meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": text}
