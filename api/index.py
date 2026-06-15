@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 from fastapi import FastAPI, Request, Response
+from contextlib import asynccontextmanager
 
 # Ensure project root is in path for Vercel serverless
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -9,7 +10,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+async def init_db():
+    from app.database import engine, Base
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/api/health")
 async def health():
