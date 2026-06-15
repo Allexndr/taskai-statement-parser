@@ -1,7 +1,11 @@
 import os
+import sys
 import logging
 from fastapi import FastAPI, Request, Response
 from contextlib import asynccontextmanager
+
+# Ensure project root is in path for Vercel serverless
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.bot import bot, dp
 from app.database import engine, Base
