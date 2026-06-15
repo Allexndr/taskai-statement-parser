@@ -2,7 +2,6 @@ import os
 import sys
 import logging
 from fastapi import FastAPI, Request, Response
-from contextlib import asynccontextmanager
 
 # Ensure project root is in path for Vercel serverless
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -10,17 +9,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_db_initialized = False
+
 async def init_db():
+    global _db_initialized
+    if _db_initialized:
+        return
     from app.database import engine, Base
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    _db_initialized = True
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await init_db()
-    yield
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 @app.get("/api/health")
 async def health():
@@ -29,6 +29,7 @@ async def health():
 @app.post("/api/webhook")
 async def telegram_webhook(request: Request):
     try:
+        await init_db()
         from app.bot import bot, dp
         from aiogram.types import Update
         data = await request.json()
