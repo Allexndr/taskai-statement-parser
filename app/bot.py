@@ -647,14 +647,13 @@ async def handle_free_text(message: types.Message, text: str):
 @dp.message()
 async def handle_message(message: types.Message):
     if message.text and not message.text.startswith('/'):
-        await message.answer(f"📝 Получил: {message.text[:100]}")
-        return  # DEBUG: skip AI parsing for now
-    if message.voice or message.audio:
+        await handle_free_text(message, message.text)
+    elif message.voice or message.audio:
         await message.answer("🎤 Распознаю голос...")
         file = await bot.get_file(message.voice.file_id if message.voice else message.audio.file_id)
         file_url = f"https://api.telegram.org/file/bot{os.getenv('BOT_TOKEN')}/{file.file_path}"
         transcript = await transcribe_voice(file_url)
-        if transcript.startswith("[Ошибка"):
+        if transcript.startswith("["):
             await message.answer(transcript, reply_markup=main_menu())
             return
         await message.answer(f"📝 <b>Распознано:</b>\n<i>{transcript[:400]}</i>", parse_mode=ParseMode.HTML)
