@@ -335,7 +335,41 @@ async def agent_parse(text: str, context: dict) -> dict:
             f"{w['title']} (цель: {kzt(w['target'])}, накоплено: {kzt(w['current'])})"
             for w in context["active_wishes"]
         ])
-        ctx_lines.append(f"- Желания и цели: {wishes_str}")
+        ctx_lines.append(f"- Желания и цели (бот): {wishes_str}")
+
+    # Enrich with Google Sheets data
+    sheets = context.get("sheets", {})
+    if sheets:
+        settings = sheets.get("settings", {})
+        if sheets.get("total_balance"):
+            ctx_lines.append(f"- Общий баланс по счетам: {sheets['total_balance']:,}₸".replace(",", " "))
+        if sheets.get("fixed_monthly"):
+            ctx_lines.append(f"- Фиксированные обязательные: {sheets['fixed_monthly']:,}₸/мес (кредит 100к + комм 30к + налоги 16к + подписки 10к)".replace(",", " "))
+        if sheets.get("month_income") is not None:
+            ctx_lines.append(f"- Доход этого месяца (таблица): {sheets['month_income']:,}₸".replace(",", " "))
+        if sheets.get("month_expense") is not None:
+            ctx_lines.append(f"- Расход этого месяца (таблица): {sheets['month_expense']:,}₸".replace(",", " "))
+        if sheets.get("month_by_cat"):
+            top = sorted(sheets["month_by_cat"].items(), key=lambda x: x[1], reverse=True)[:3]
+            ctx_lines.append(f"- Топ трат месяца: {', '.join(f'{k}: {v:,}₸' for k,v in top)}".replace(",", " "))
+        goals = sheets.get("goals", [])
+        if goals:
+            g_str = "; ".join([
+                f"{g['title']}: цель {g['target']:,}₸, накоплено {g['current']:,}₸, нужно {g['monthly_needed']:,}₸/мес, дедлайн {g['deadline']}"
+                for g in goals if g['title']
+            ]).replace(",", " ")
+            ctx_lines.append(f"- Финансовые цели: {g_str}")
+        accs = [a for a in sheets.get("accounts", []) if a["balance"] > 0]
+        if accs:
+            accs_str = "; ".join(f"{a['name']} ({a['bank']}): {a['balance']:,}₸".replace(",", " ") for a in accs)
+            ctx_lines.append(f"- Счета: {accs_str}")
+        # Expected income
+        income_kcell = settings.get("income_kcell_summer", 0)
+        income_ip = settings.get("income_ip", 0)
+        if income_kcell:
+            ctx_lines.append(f"- Ожидаемый доход Kcell (июль-сент): {income_kcell:,}₸/мес".replace(",", " "))
+        if income_ip:
+            ctx_lines.append(f"- Ожидаемый доход ИП: {income_ip:,}₸/мес".replace(",", " "))
 
     context_str = "\n".join(ctx_lines) if ctx_lines else "(данных пока нет — пользователь новый, скоро заполнит)"
 

@@ -18,6 +18,11 @@ from app.finance_service import (
 )
 from app.finance_ai_parser import parse_finance_text, parse_wish_text, parse_finance_settings
 from sqlalchemy import select, update
+try:
+    from app.sheets_service import get_sheet_context, add_operation_to_sheet
+    SHEETS_ENABLED = True
+except Exception:
+    SHEETS_ENABLED = False
 
 bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher()
@@ -614,17 +619,33 @@ async def get_user_context(session, user_id: str) -> dict:
 async def handle_free_text(message: types.Message, text: str):
     async with async_session() as session:
         user = await get_or_create_user(session, message.from_user.id)
-        # Load full context for the thinking agent (with 4s timeout)
         try:
             context = await asyncio.wait_for(get_user_context(session, user.id), timeout=4.0)
-        except asyncio.TimeoutError:
-            context = {}
         except Exception:
             context = {}
 
-    # Agent thinks with full context (with 4s timeout)
+    # Enrich context with Google Sheets data
+    if SHEETS_ENABLED:
+        try:
+            sheets_ctx = await asyncio.get_event_loop().run_in_executor(None, get_sheet_context)
+            context["sheets"] = sheets_ctx
+            # Merge key financial data from sheets into context
+            s = sheets_ctx["settings"]
+            if not context.get("salary") and s.get("income_kcell_summer"):
+                context["salary"] = s["income_kcell_summer"] * 100
+            if not context.get("fixed_expenses") and sheets_ctx.get("fixed_monthly"):
+                context["fixed_expenses"] = sheets_ctx["fixed_monthly"] * 100
+            if not context.get("savings_potential"):
+                context["savings_potential"] = sheets_ctx.get("free_to_save", 0) * 100
+            context["goals"] = sheets_ctx.get("goals", [])
+            context["total_balance"] = sheets_ctx.get("total_balance", 0)
+            context["accounts"] = sheets_ctx.get("accounts", [])
+        except Exception:
+            pass
+
+    # Agent thinks with full context (with 5s timeout)
     try:
-        parsed = await asyncio.wait_for(agent_parse(text, context), timeout=4.0)
+        parsed = await asyncio.wait_for(agent_parse(text, context), timeout=5.0)
     except asyncio.TimeoutError:
         parsed = await asyncio.wait_for(unified_parse(text), timeout=4.0)
     except Exception:
@@ -670,10 +691,24 @@ async def handle_free_text(message: types.Message, text: str):
                 session, user.id, amount=parsed["amount"] * 100,
                 type_=TransactionType.income if parsed["type_tx"] == "income" else TransactionType.expense,
                 category=parsed["category"], description=parsed.get("description", text[:200]))
+        # Also write to Google Sheet
+        if SHEETS_ENABLED:
+            try:
+                tx_type_sheet = "Доход" if parsed["type_tx"] == "income" else "Расход"
+                today_str = datetime.now().strftime("%d.%m.%Y")
+                await asyncio.get_event_loop().run_in_executor(None, lambda: add_operation_to_sheet(
+                    date=today_str, tx_type=tx_type_sheet,
+                    category=parsed["category"], subcategory="",
+                    account="Kaspi карта", counterpart="",
+                    description=parsed.get("description", text[:100]),
+                    amount=int(parsed["amount"])
+                ))
+            except Exception:
+                pass
         emoji = "➕" if parsed["type_tx"] == "income" else "➖"
         sign = "Доход" if parsed["type_tx"] == "income" else "Расход"
         await message.answer(
-            f"{emoji} <b>{sign} записан!</b>\n\nСумма: {parsed['amount']:,.0f}₸\nКатегория: {parsed['category']}",
+            f"{emoji} <b>{sign} записан!</b>\n\nСумма: {parsed['amount']:,.0f}₸\nКатегория: {parsed['category']}\n📊 Записано в таблицу",
             reply_markup=main_menu(), parse_mode=ParseMode.HTML)
         return
 

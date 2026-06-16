@@ -11,3 +11,6 @@ dist/
 build/
 alembic/versions/*.pyc
 .vercel
+*.json.key
+gen-lang-client-*.json
+credentials*.json
