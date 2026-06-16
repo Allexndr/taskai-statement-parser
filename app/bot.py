@@ -24,6 +24,7 @@ dp = Dispatcher()
 
 CONFIDENCE_THRESHOLD = 75
 PAGE_SIZE = 5
+ALLOWED_USER_ID = 5450018125
 
 
 CURRENCY = "₸"
@@ -74,8 +75,14 @@ async def edit_to_main(callback: types.CallbackQuery):
 
 # ═══ START / MENU ═══
 
+def is_allowed(user_id: int) -> bool:
+    return user_id == ALLOWED_USER_ID
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        return
     async with async_session() as session:
         await get_or_create_user(session, telegram_id=message.from_user.id,
             username=message.from_user.username, first_name=message.from_user.first_name,
@@ -342,6 +349,9 @@ async def render_wish_detail(callback: types.CallbackQuery, wish_id: str):
 
 @dp.callback_query()
 async def handle_callback(callback: types.CallbackQuery):
+    if not is_allowed(callback.from_user.id):
+        await callback.answer()
+        return
     data = callback.data
     parts = data.split(":")
     action = parts[0]
@@ -717,6 +727,8 @@ async def handle_free_text(message: types.Message, text: str):
 
 @dp.message()
 async def handle_message(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        return
     if message.text and not message.text.startswith('/'):
         await handle_free_text(message, message.text)
     elif message.voice or message.audio:
