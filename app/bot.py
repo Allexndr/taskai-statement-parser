@@ -26,8 +26,10 @@ CONFIDENCE_THRESHOLD = 75
 PAGE_SIZE = 5
 
 
+CURRENCY = "₸"
+
 def fmt_money(amount: int) -> str:
-    return f"{amount/100:,.0f}₽".replace(",", " ")
+    return f"{amount/100:,.0f}{CURRENCY}".replace(",", " ")
 
 
 def kb(buttons: list) -> InlineKeyboardMarkup:
@@ -325,9 +327,10 @@ async def render_wish_detail(callback: types.CallbackQuery, wish_id: str):
         text += f"📅 {timeline.get('completion_date', '')}\n"
 
     buttons = [
-        [InlineKeyboardButton(text="💰 +1000₽", callback_data=f"wish:save:{wish.id}:100000")],
-        [InlineKeyboardButton(text="💰 +5000₽", callback_data=f"wish:save:{wish.id}:500000")],
-        [InlineKeyboardButton(text="💰 +10000₽", callback_data=f"wish:save:{wish.id}:1000000")],
+        [InlineKeyboardButton(text="💰 +5 000₸", callback_data=f"wish:save:{wish.id}:500000"),
+         InlineKeyboardButton(text="💰 +10 000₸", callback_data=f"wish:save:{wish.id}:1000000")],
+        [InlineKeyboardButton(text="💰 +50 000₸", callback_data=f"wish:save:{wish.id}:5000000"),
+         InlineKeyboardButton(text="💰 +100 000₸", callback_data=f"wish:save:{wish.id}:10000000")],
         [InlineKeyboardButton(text="❌ Удалить", callback_data=f"wish:delete:{wish.id}")],
         [back_btn("wishes:list:0")],
     ]
@@ -579,7 +582,7 @@ async def get_user_context(session, user_id: str) -> dict:
 
     # Top 3 expenses
     top = dict(sorted(stats["by_category"].items(), key=lambda x: x[1], reverse=True)[:3])
-    ctx["top_expenses"] = ", ".join([f"{k}: {v/100:,.0f}₽" for k, v in top.items()]) if top else None
+    ctx["top_expenses"] = ", ".join([f"{k}: {v/100:,.0f}₸" for k, v in top.items()]) if top else None
 
     # Tasks
     tasks = await get_user_tasks(session, user_id, status="new", limit=20)
@@ -660,7 +663,7 @@ async def handle_free_text(message: types.Message, text: str):
         emoji = "➕" if parsed["type_tx"] == "income" else "➖"
         sign = "Доход" if parsed["type_tx"] == "income" else "Расход"
         await message.answer(
-            f"{emoji} <b>{sign} записан!</b>\n\nСумма: {parsed['amount']:,.0f}₽\nКатегория: {parsed['category']}",
+            f"{emoji} <b>{sign} записан!</b>\n\nСумма: {parsed['amount']:,.0f}₸\nКатегория: {parsed['category']}",
             reply_markup=main_menu(), parse_mode=ParseMode.HTML)
         return
 
@@ -677,14 +680,14 @@ async def handle_free_text(message: types.Message, text: str):
         if timeline.get("months") is not None:
             extra = f"\n⏱ ~{timeline['months']} мес до цели"
         await message.answer(
-            f"🎯 <b>Желание добавлено!</b>\n\n<b>{w.title}</b>\n💰 Цель: {w.target_amount/100:,.0f}₽\n📂 {w.category or 'Другое'}{extra}",
+            f"🎯 <b>Желание добавлено!</b>\n\n<b>{w.title}</b>\n💰 Цель: {w.target_amount/100:,.0f}₸\n📂 {w.category or 'Другое'}{extra}",
             reply_markup=main_menu(), parse_mode=ParseMode.HTML)
         return
 
     # 4. Task
-    if msg_type != "task" or not parsed.get("is_task"):
+    if msg_type not in ("task",) or not parsed.get("is_task"):
         await message.answer(
-            "🤔 Это задача или заметка?\n\nНапиши по-другому или выбери раздел в меню.",
+            "🤔 Не понял что делать с этим.\n\nМожешь написать: задачу, трату, желание, или задать вопрос по бюджету.",
             reply_markup=main_menu(), parse_mode=ParseMode.HTML)
         return
 

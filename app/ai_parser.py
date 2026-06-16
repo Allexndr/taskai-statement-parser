@@ -242,57 +242,66 @@ async def unified_parse(text: str) -> dict:
         }
 
 
-AGENT_PROMPT = """Ты — личный AI-агент Taski. У тебя есть полный контекст данных пользователя.
-Твоя задача — понять намерение пользователя, проанализировать контекст и принять решение.
+AGENT_PROMPT = """Ты — личный финансовый агент и ассистент Taski. Ты работаешь в Казахстане, валюта — тенге (₸, KZT).
+Ты умеешь вести задачи, записывать финансы, анализировать бюджет и давать умные советы.
+Ты — как финансовый директор в кармане: задаёшь правильные вопросы, считаешь, предлагаешь распределение.
 
-Данные пользователя (текущие):
+Данные пользователя прямо сейчас:
 {context}
 
-Текущая дата: {today}
+Сегодня: {today}
 
 Возможные действия:
-- "create_task" — создать задачу
-- "create_transaction" — записать доход/расход
-- "update_settings" — обновить зарплату/расходы
-- "create_wish" — добавить желание/цель
-- "ask_question" — переспросить пользователя для уточнения
-- "answer" — просто ответить на вопрос (анализ бюджета, совет, расчёт)
-- "unknown" — не понял, что делать
+- "create_task" — создать задачу, дело, напоминание
+- "create_transaction" — записать доход или расход (деньги уже потрачены/получены)
+- "update_settings" — сохранить зарплату, фиксированные расходы пользователя
+- "create_wish" — добавить желание/цель накопления
+- "ask_question" — переспросить, если сообщение слишком короткое, непонятное или неоднозначное
+- "answer" — ответить на вопрос, дать совет, посчитать бюджет, проанализировать финансы
 
-Рассуждай шаг за шагом:
-1. Что хочет пользователь?
-2. Какие данные из контекста релевантны?
-3. Есть ли неоднозначность? Если да — задай уточняющий вопрос.
-4. Какое действие выполнить?
+Как рассуждать:
+1. Если сообщение короткое (1-2 символа, опечатка, обрывок) — action: ask_question, спроси что имел в виду.
+2. Если пользователь спрашивает про бюджет, накопления, советы — action: answer, используй данные из контекста.
+3. Если пользователь называет зарплату, доход, расходы — action: update_settings.
+4. Если пользователь говорит о конкретной трате или поступлении — action: create_transaction.
+5. Если пользователь говорит "хочу X за Y тенге/тысяч" — action: create_wish.
+6. Если пользователь пишет задачу, дело, напоминание — action: create_task.
+7. Если неоднозначно (например, "перевод 50к" без контекста) — задай уточняющий вопрос.
 
-Ответ СТРОГО в JSON:
+Правила по суммам (Казахстан):
+- "к", "тыс", "тысяч" = умножить на 1000 (50к = 50000)
+- "млн", "миллион" = умножить на 1000000 (1.5 млн = 1500000)
+- "." в числах часто разделитель тысяч: 370.000 = 370000
+- Все суммы в тенге (KZT), знак ₸
+
+Финансовые советы (для action: answer):
+- Если спрашивают "сколько откладывать" — посчитай: (зарплата + ИП) - обязательные расходы - расходы на жизнь = свободные деньги, из них рекомендуй откладывать 20-30%.
+- Если спрашивают про отпуск/цель — посчитай сколько месяцев нужно при текущем балансе.
+- Если нет данных в контексте — спроси нужные цифры.
+- Пиши конкретные суммы в тенге, не проценты без цифр.
+- Будь кратким и по делу, как финансовый директор.
+
+Ответ СТРОГО в JSON (без markdown, только JSON):
 {{
-  "action": "create_task|create_transaction|update_settings|create_wish|ask_question|answer|unknown",
+  "action": "create_task|create_transaction|update_settings|create_wish|ask_question|answer",
   "confidence": число 0-100,
-  "reasoning": "краткое рассуждение",
+  "reasoning": "краткое рассуждение на русском",
   "data": {{
-    // для create_task:
-    "title": "...", "description": "...", "category": "...", "priority": "...", "due_at": "..." или null,
-    // для create_transaction:
-    "type": "income|expense", "amount": число, "category": "...", "description": "...",
-    // для update_settings:
-    "monthly_salary": число или null, "monthly_expenses": число или null,
-    // для create_wish:
-    "title": "...", "target_amount": число, "category": "...", "priority": "...", "deadline": "YYYY-MM-DD" или null,
-    // для ask_question:
-    "question": "текст вопроса",
-    // для answer:
-    "text": "текст ответа"
+    "title": "...",
+    "description": null,
+    "category": "...",
+    "priority": "low|medium|high|critical",
+    "due_at": "YYYY-MM-DDTHH:MM:SS или null",
+    "type": "income|expense",
+    "amount": число,
+    "monthly_salary": число или null,
+    "monthly_expenses": число или null,
+    "target_amount": число,
+    "deadline": "YYYY-MM-DD или null",
+    "question": "текст вопроса пользователю",
+    "text": "текст ответа/совета"
   }}
 }}
-
-Критические правила контекста:
-- "зарплата", "доход", "расходы", "трачу", "бюджет" → finance (settings или transaction)
-- "В кселл зарплата 370.000" → update_settings, monthly_salary: 370000
-- "проверить цены в кселл" → create_task
-- "сколько откладывать" → answer, используй savings_potential из контекста
-- "когда накоплю на..." → answer, используй wish timeline из контекста
-- Если не уверен (>70%%) — спроси, а не гадай.
 """
 
 
@@ -300,29 +309,35 @@ async def agent_parse(text: str, context: dict) -> dict:
     """Thinking agent with full user context."""
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # Build context string
+    # Build rich context string in KZT
     ctx_lines = []
+    def kzt(val): return f"{val/100:,.0f}₸".replace(",", " ") if val else "0₸"
+
     if context.get("salary"):
-        ctx_lines.append(f"- Зарплата: {context['salary']:,}₽/мес")
+        ctx_lines.append(f"- Зарплата (сохранена): {kzt(context['salary'])}/мес")
     if context.get("fixed_expenses"):
-        ctx_lines.append(f"- Фиксированные расходы: {context['fixed_expenses']:,}₽/мес")
+        ctx_lines.append(f"- Фиксированные расходы (кредит+комм+налоги): {kzt(context['fixed_expenses'])}/мес")
     if context.get("monthly_income") is not None:
-        ctx_lines.append(f"- Доход за текущий месяц: {context['monthly_income']:,}₽")
+        ctx_lines.append(f"- Доход за текущий месяц (реальный): {kzt(context['monthly_income'])}")
     if context.get("monthly_expenses") is not None:
-        ctx_lines.append(f"- Траты за текущий месяц: {context['monthly_expenses']:,}₽")
+        ctx_lines.append(f"- Траты за текущий месяц: {kzt(context['monthly_expenses'])}")
     if context.get("savings_potential") is not None:
-        ctx_lines.append(f"- Свободно для накоплений: {context['savings_potential']:,}₽/мес")
+        sp = context["savings_potential"]
+        ctx_lines.append(f"- Доступно для накоплений: {kzt(sp)}/мес ({'профицит' if sp > 0 else 'дефицит'})")
     if context.get("top_expenses"):
-        ctx_lines.append(f"- Топ трат: {context['top_expenses']}")
+        ctx_lines.append(f"- Топ категорий трат: {context['top_expenses']}")
     if context.get("active_tasks_count") is not None:
         ctx_lines.append(f"- Активных задач: {context['active_tasks_count']}")
     if context.get("today_tasks"):
         ctx_lines.append(f"- Задачи на сегодня: {', '.join(context['today_tasks'])}")
     if context.get("active_wishes"):
-        wishes = ", ".join([f"{w['title']} ({w['target']:,}₽)" for w in context["active_wishes"]])
-        ctx_lines.append(f"- Желания: {wishes}")
+        wishes_str = "; ".join([
+            f"{w['title']} (цель: {kzt(w['target'])}, накоплено: {kzt(w['current'])})"
+            for w in context["active_wishes"]
+        ])
+        ctx_lines.append(f"- Желания и цели: {wishes_str}")
 
-    context_str = "\n".join(ctx_lines) if ctx_lines else "(данных пока нет — пользователь новый)"
+    context_str = "\n".join(ctx_lines) if ctx_lines else "(данных пока нет — пользователь новый, скоро заполнит)"
 
     messages = [
         {"role": "system", "content": AGENT_PROMPT.format(context=context_str, today=today)},
@@ -333,20 +348,30 @@ async def agent_parse(text: str, context: dict) -> dict:
         response = await client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=messages,
-            temperature=0.2,
-            max_tokens=600
+            temperature=0.15,
+            max_tokens=700
         )
-        result = json.loads(response.choices[0].message.content)
+
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown code blocks if model wraps in ```json
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw)
 
         action = result.get("action", "unknown")
-        data = result.get("data", {})
+        # Support both flat data and nested data
+        data = result.get("data", result)
 
         # Normalize to unified format
         if action == "update_settings":
+            sal = data.get("monthly_salary")
+            exp = data.get("monthly_expenses")
             return {
                 "type": "finance_settings",
-                "monthly_salary": data.get("monthly_salary"),
-                "monthly_expenses": data.get("monthly_expenses"),
+                "monthly_salary": sal,
+                "monthly_expenses": exp,
                 "reasoning": result.get("reasoning", ""),
             }
 
@@ -357,7 +382,7 @@ async def agent_parse(text: str, context: dict) -> dict:
                 "type_tx": data.get("type", "expense"),
                 "amount": data.get("amount", 0),
                 "category": data.get("category", "Другое"),
-                "description": data.get("description", text[:200]),
+                "description": data.get("description") or text[:200],
                 "confidence": result.get("confidence", 80),
                 "reasoning": result.get("reasoning", ""),
             }
@@ -377,10 +402,10 @@ async def agent_parse(text: str, context: dict) -> dict:
 
         if action == "create_task":
             due = data.get("due_at")
-            if due:
+            if due and isinstance(due, str):
                 try:
                     datetime.fromisoformat(due.replace('Z', '+00:00'))
-                except ValueError:
+                except (ValueError, AttributeError):
                     due = None
             return {
                 "type": "task",
@@ -390,8 +415,8 @@ async def agent_parse(text: str, context: dict) -> dict:
                 "category": data.get("category", "Другое"),
                 "priority": data.get("priority", "medium"),
                 "due_at": due,
-                "confidence_category": data.get("confidence_category", 50),
-                "confidence_priority": data.get("confidence_priority", 50),
+                "confidence_category": data.get("confidence_category", 60),
+                "confidence_priority": data.get("confidence_priority", 60),
                 "confidence": result.get("confidence", 80),
                 "reasoning": result.get("reasoning", ""),
             }
@@ -399,14 +424,14 @@ async def agent_parse(text: str, context: dict) -> dict:
         if action == "ask_question":
             return {
                 "type": "question",
-                "question": data.get("question", "Можешь уточнить?"),
+                "question": data.get("question", "Можешь уточнить, что ты имеешь в виду?"),
                 "reasoning": result.get("reasoning", ""),
             }
 
         if action == "answer":
             return {
                 "type": "answer",
-                "text": data.get("text", "Не могу ответить на это прямо сейчас."),
+                "text": data.get("text", ""),
                 "reasoning": result.get("reasoning", ""),
             }
 
