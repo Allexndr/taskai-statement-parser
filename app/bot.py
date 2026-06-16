@@ -613,6 +613,26 @@ async def get_user_context(session, user_id: str) -> dict:
         for w in wishes[:5]
     ] if wishes else []
 
+    # Last 10 transactions from DB
+    from app.models import Transaction
+    tx_result = await session.execute(
+        select(Transaction)
+        .where(Transaction.user_id == user_id)
+        .order_by(Transaction.created_at.desc())
+        .limit(10)
+    )
+    last_txs = tx_result.scalars().all()
+    ctx["last_transactions"] = [
+        {
+            "date": t.created_at.strftime("%d.%m.%Y") if t.created_at else "?",
+            "type": t.type.value,
+            "category": t.category,
+            "amount": t.amount,
+            "description": (t.description or "")[:60],
+        }
+        for t in last_txs
+    ]
+
     return ctx
 
 
@@ -665,6 +685,37 @@ async def handle_free_text(message: types.Message, text: str):
         await message.answer(
             f"💡 {parsed['text']}",
             reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+        return
+
+    # 0.7. Cancel last transaction
+    if msg_type == "cancel_transaction":
+        from sqlalchemy import delete as sql_delete
+        from app.models import Transaction
+        async with async_session() as session:
+            user = await get_or_create_user(session, message.from_user.id)
+            # Find the most recent transaction
+            result = await session.execute(
+                select(Transaction)
+                .where(Transaction.user_id == user.id)
+                .order_by(Transaction.created_at.desc())
+                .limit(1)
+            )
+            last_tx = result.scalar_one_or_none()
+            if last_tx:
+                desc = last_tx.description or ""
+                amt = last_tx.amount
+                cat = last_tx.category
+                await session.delete(last_tx)
+                await session.commit()
+                await message.answer(
+                    f"🗑 <b>Операция отменена</b>\n\n"
+                    f"Удалено: {fmt_money(amt)} — {cat}\n"
+                    f"{desc[:80] if desc else ''}",
+                    reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+            else:
+                await message.answer(
+                    "🤷 Нет операций для отмены.",
+                    reply_markup=main_menu(), parse_mode=ParseMode.HTML)
         return
 
     # 1. Finance settings

@@ -252,21 +252,26 @@ AGENT_PROMPT = """Ты — личный финансовый агент и ас�
 Сегодня: {today}
 
 Возможные действия:
-- "create_task" — создать задачу, дело, напоминание
 - "create_transaction" — записать доход или расход (деньги уже потрачены/получены)
+- "cancel_transaction" — отменить/удалить последнюю операцию (пользователь просит отменить, исправить, удалить)
+- "create_task" — создать задачу, дело, напоминание
 - "update_settings" — сохранить зарплату, фиксированные расходы пользователя
-- "create_wish" — добавить желание/цель накопления
-- "ask_question" — переспросить, если сообщение слишком короткое, непонятное или неоднозначное
-- "answer" — ответить на вопрос, дать совет, посчитать бюджет, проанализировать финансы
+- "create_wish" — добавить желание/цель накопления (только будущая цель, не текущая трата)
+- "ask_question" — переспросить, если сообщение слишком короткое или неоднозначное
+- "answer" — ответить на вопрос, дать совет, посчитать бюджет
 
-Как рассуждать:
-1. Если сообщение короткое (1-2 символа, опечатка, обрывок) — action: ask_question, спроси что имел в виду.
-2. Если пользователь спрашивает про бюджет, накопления, советы — action: answer, используй данные из контекста.
-3. Если пользователь называет зарплату, доход, расходы — action: update_settings.
-4. Если пользователь говорит о конкретной трате или поступлении — action: create_transaction.
-5. Если пользователь говорит "хочу X за Y тенге/тысяч" — action: create_wish.
-6. Если пользователь пишет задачу, дело, напоминание — action: create_task.
-7. Если неоднозначно (например, "перевод 50к" без контекста) — задай уточняющий вопрос.
+Как рассуждать (СТРОГО по порядку):
+1. Если есть слово "отмени", "отмена", "удали", "убери", "исправь" + описание операции — action: cancel_transaction. Опиши что отменить в data.description.
+2. Если есть СУММА + глагол прошедшего времени (потратил, заплатил, купил, отправил, скинул, оплатил, снял, дал, взял) — это РАСХОД или ДОХОД, action: create_transaction. НЕ create_wish.
+3. Если сообщение короткое (1-2 символа, обрывок) — action: ask_question.
+4. Если пользователь спрашивает про бюджет, советы, анализ — action: answer.
+5. Если пользователь называет свою зарплату или месячные расходы — action: update_settings.
+6. Если пользователь говорит "хочу купить X", "мечтаю о X", "коплю на X" (БУДУЩЕЕ) — action: create_wish.
+7. Если пишет задачу/напоминание/дело — action: create_task.
+8. Если неоднозначно — action: ask_question.
+
+ВАЖНО: "отправил 2000 на подарок" = create_transaction (expense), НЕ create_wish.
+"хочу подарить Свете" без суммы = ask_question (уточни сумму).
 
 Категории расходов (используй точные названия):
 - Еда — продукты, кафе, доставка, рестораны
@@ -299,7 +304,7 @@ AGENT_PROMPT = """Ты — личный финансовый агент и ас�
 
 Ответ СТРОГО в JSON (без markdown, только JSON):
 {{
-  "action": "create_task|create_transaction|update_settings|create_wish|ask_question|answer",
+  "action": "create_task|create_transaction|cancel_transaction|update_settings|create_wish|ask_question|answer",
   "confidence": число 0-100,
   "reasoning": "краткое рассуждение на русском",
   "data": {{
@@ -353,6 +358,17 @@ async def agent_parse(text: str, context: dict) -> dict:
         ])
         ctx_lines.append(f"- Желания и цели (бот): {wishes_str}")
 
+    # Last transactions from DB (most important for "на что последний расход" type questions)
+    last_txs = context.get("last_transactions", [])
+    if last_txs:
+        tx_lines = []
+        for t in last_txs[:7]:
+            sign = "+" if t["type"] == "income" else "-"
+            amt = t["amount"] / 100
+            desc = f" ({t['description']})" if t.get("description") else ""
+            tx_lines.append(f"{t['date']} {sign}{amt:,.0f}₸ [{t['category']}]{desc}".replace(",", " "))
+        ctx_lines.append("- Последние операции (бот):\n  " + "\n  ".join(tx_lines))
+
     # Enrich with Google Sheets data
     sheets = context.get("sheets", {})
     if sheets:
@@ -386,6 +402,14 @@ async def agent_parse(text: str, context: dict) -> dict:
             ctx_lines.append(f"- Ожидаемый доход Kcell (июль-сент): {income_kcell:,}₸/мес".replace(",", " "))
         if income_ip:
             ctx_lines.append(f"- Ожидаемый доход ИП: {income_ip:,}₸/мес".replace(",", " "))
+        # Recent ops from sheets (last 5 real expenses/income)
+        recent = [o for o in sheets.get("current_ops", []) if o.get("type") in ("Расход", "Доход")][:5]
+        if recent:
+            r_lines = [
+                f"{o['date']} {'-' if o['type']=='Расход' else '+'}{o['amount']:,}₸ [{o['category']}] {o['description'][:40]}".replace(",", " ")
+                for o in recent
+            ]
+            ctx_lines.append("- Последние операции (таблица):\n  " + "\n  ".join(r_lines))
 
     context_str = "\n".join(ctx_lines) if ctx_lines else "(данных пока нет — пользователь новый, скоро заполнит)"
 
@@ -422,6 +446,13 @@ async def agent_parse(text: str, context: dict) -> dict:
                 "type": "finance_settings",
                 "monthly_salary": sal,
                 "monthly_expenses": exp,
+                "reasoning": result.get("reasoning", ""),
+            }
+
+        if action == "cancel_transaction":
+            return {
+                "type": "cancel_transaction",
+                "description": data.get("description") or text[:200],
                 "reasoning": result.get("reasoning", ""),
             }
 
