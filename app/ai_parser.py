@@ -253,7 +253,8 @@ AGENT_PROMPT = """Ты — личный финансовый агент и ас�
 
 Возможные действия:
 - "create_transaction" — записать доход или расход (деньги уже потрачены/получены)
-- "cancel_transaction" — отменить/удалить последнюю операцию (пользователь просит отменить, исправить, удалить)
+- "cancel_transaction" — отменить/удалить последнюю операцию
+- "edit_transaction" — исправить последнюю операцию: изменить сумму или категорию
 - "create_task" — создать задачу, дело, напоминание
 - "update_settings" — сохранить зарплату, фиксированные расходы пользователя
 - "create_wish" — добавить желание/цель накопления (только будущая цель, не текущая трата)
@@ -261,7 +262,8 @@ AGENT_PROMPT = """Ты — личный финансовый агент и ас�
 - "answer" — ответить на вопрос, дать совет, посчитать бюджет
 
 Как рассуждать (СТРОГО по порядку):
-1. Если есть слово "отмени", "отмена", "удали", "убери", "исправь" + описание операции — action: cancel_transaction. Опиши что отменить в data.description.
+1. Если есть "исправь сумму", "измени категорию" — action: edit_transaction. В data.amount новая сумма (0 если не меняется), в data.category новая категория (null если не меняется).
+1b. Если есть "отмени", "удали", "убери" + описание операции — action: cancel_transaction.
 2. Если есть СУММА + глагол прошедшего времени (потратил, заплатил, купил, отправил, скинул, оплатил, снял, дал, взял) — это РАСХОД или ДОХОД, action: create_transaction. НЕ create_wish.
 3. Если сообщение короткое (1-2 символа, обрывок) — action: ask_question.
 4. Если пользователь спрашивает про бюджет, советы, анализ — action: answer.
@@ -453,6 +455,14 @@ async def agent_parse(text: str, context: dict) -> dict:
             return {
                 "type": "cancel_transaction",
                 "description": data.get("description") or text[:200],
+                "reasoning": result.get("reasoning", ""),
+            }
+
+        if action == "edit_transaction":
+            return {
+                "type": "edit_transaction",
+                "amount": data.get("amount", 0),
+                "category": data.get("category"),
                 "reasoning": result.get("reasoning", ""),
             }
 

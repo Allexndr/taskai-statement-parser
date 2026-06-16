@@ -958,6 +958,38 @@ async def handle_free_text(message: types.Message, text: str):
                 await message.answer("🤷 Нет операций для отмены.", reply_markup=main_menu(), parse_mode=ParseMode.HTML)
         return
 
+    # 0.8. Edit last transaction (change amount or category)
+    if msg_type == "edit_transaction":
+        from app.models import Transaction
+        async with async_session() as session:
+            user = await get_or_create_user(session, message.from_user.id)
+            sess = _session.get(message.from_user.id, {})
+            last_id = sess.get("last_tx_id")
+            if last_id:
+                result = await session.execute(select(Transaction).where(Transaction.id == last_id))
+            else:
+                result = await session.execute(
+                    select(Transaction).where(Transaction.user_id == user.id)
+                    .order_by(Transaction.created_at.desc()).limit(1)
+                )
+            last_tx = result.scalar_one_or_none()
+            if last_tx:
+                new_amount = parsed.get("amount", 0)
+                new_cat = parsed.get("category")
+                if new_amount and new_amount > 0:
+                    last_tx.amount = int(new_amount) * 100
+                if new_cat:
+                    last_tx.category = new_cat
+                await session.commit()
+                await message.answer(
+                    f"✏️ <b>Операция обновлена</b>\n\n"
+                    f"Сумма: {fmt_money(last_tx.amount)}\n"
+                    f"Категория: {last_tx.category}",
+                    reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+            else:
+                await message.answer("🤷 Нет операции для изменения.", reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+        return
+
     # 1. Finance settings
     if msg_type == "finance_settings":
         async with async_session() as session:
