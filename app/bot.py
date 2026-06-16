@@ -17,7 +17,7 @@ from app.finance_service import (
     add_to_wish, get_active_wishes, calculate_wish_timeline, FINANCE_CATEGORIES
 )
 from app.finance_ai_parser import parse_finance_text, parse_wish_text, parse_finance_settings
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func, and_
 try:
     from app.sheets_service import get_sheet_context, add_operation_to_sheet
     SHEETS_ENABLED = True
@@ -30,6 +30,9 @@ dp = Dispatcher()
 CONFIDENCE_THRESHOLD = 75
 PAGE_SIZE = 5
 ALLOWED_USER_ID = 5450018125
+
+# In-memory session context: stores last action per user for undo/edit
+_session: dict = {}  # user_id -> {"last_tx_id": ..., "last_action": ...}
 
 
 CURRENCY = "₸"
@@ -44,9 +47,10 @@ def kb(buttons: list) -> InlineKeyboardMarkup:
 
 def main_menu() -> InlineKeyboardMarkup:
     return kb([
-        [InlineKeyboardButton(text="📝 Задачи", callback_data="menu:tasks")],
-        [InlineKeyboardButton(text="💰 Финансы", callback_data="menu:finance")],
-        [InlineKeyboardButton(text="🎯 Желания", callback_data="menu:wishes")],
+        [InlineKeyboardButton(text="📝 Задачи", callback_data="menu:tasks"),
+         InlineKeyboardButton(text="💰 Финансы", callback_data="menu:finance")],
+        [InlineKeyboardButton(text="🎯 Желания", callback_data="menu:wishes"),
+         InlineKeyboardButton(text="📊 Отчёт", callback_data="finance:report")],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
     ])
 
@@ -104,6 +108,70 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("menu"))
 async def cmd_menu(message: types.Message):
     await message.answer("<b>🤖 Taski — Главное меню</b>", reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("report", "отчет", "отчёт"))
+async def cmd_report(message: types.Message):
+    if not is_allowed(message.from_user.id): return
+    class FakeCallback:
+        from_user = message.from_user
+        async def answer(self, *a, **kw): pass
+        class message:
+            pass
+    cb = FakeCallback()
+    cb.message = message
+    cb.message.edit_text = message.answer
+    await render_finance_report(cb)
+
+
+@dp.message(Command("balance", "баланс"))
+async def cmd_balance(message: types.Message):
+    if not is_allowed(message.from_user.id): return
+    class FakeCallback:
+        from_user = message.from_user
+        async def answer(self, *a, **kw): pass
+        class message:
+            pass
+    cb = FakeCallback()
+    cb.message = message
+    cb.message.edit_text = message.answer
+    await render_finance_balance(cb)
+
+
+@dp.message(Command("last", "история"))
+async def cmd_last(message: types.Message):
+    if not is_allowed(message.from_user.id): return
+    class FakeCallback:
+        from_user = message.from_user
+        async def answer(self, *a, **kw): pass
+        class message:
+            pass
+    cb = FakeCallback()
+    cb.message = message
+    cb.message.edit_text = message.answer
+    await render_finance_history(cb, 0)
+
+
+@dp.message(Command("help", "помощь"))
+async def cmd_help(message: types.Message):
+    if not is_allowed(message.from_user.id): return
+    await message.answer(
+        "<b>🤖 Taski — что умею</b>\n\n"
+        "<b>💬 Просто напиши:</b>\n"
+        "• <code>Потратил 2000 на кофе</code> → запишу расход\n"
+        "• <code>Получил 150000 зарплата</code> → запишу доход\n"
+        "• <code>Хочу MacBook за 200к</code> → добавлю цель\n"
+        "• <code>Отмени последнюю операцию</code> → удалю\n"
+        "• <code>Сколько потратил в этом месяце?</code> → отвечу\n"
+        "• <code>На что последний расход?</code> → покажу\n"
+        "• <code>Как идут накопления на отпуск?</code> → посчитаю\n\n"
+        "<b>⚡ Быстрые команды:</b>\n"
+        "/report — отчёт за месяц\n"
+        "/balance — баланс\n"
+        "/last — история операций\n"
+        "/menu — главное меню\n\n"
+        "<b>🎙 Голос:</b> Говори — распознаю и обработаю",
+        reply_markup=main_menu(), parse_mode=ParseMode.HTML)
 
 
 # ═══ TASKS MENU ═══
@@ -212,13 +280,155 @@ async def render_task_detail(callback: types.CallbackQuery, task_id: str):
 
 def finance_menu_kb() -> InlineKeyboardMarkup:
     return kb([
-        [InlineKeyboardButton(text="📊 Баланс", callback_data="finance:balance")],
-        [InlineKeyboardButton(text="➕ Доход", callback_data="finance:add_income")],
-        [InlineKeyboardButton(text="➖ Расход", callback_data="finance:add_expense")],
+        [InlineKeyboardButton(text="📊 Баланс", callback_data="finance:balance"),
+         InlineKeyboardButton(text="📈 Отчёт", callback_data="finance:report")],
+        [InlineKeyboardButton(text="➕ Доход", callback_data="finance:add_income"),
+         InlineKeyboardButton(text="➖ Расход", callback_data="finance:add_expense")],
         [InlineKeyboardButton(text="📋 История", callback_data="finance:list:0")],
         [InlineKeyboardButton(text="⚙️ Зарплата", callback_data="finance:settings")],
         [back_btn("menu:main")],
     ])
+
+
+def bar(amount: int, max_amount: int, width: int = 10) -> str:
+    if max_amount == 0:
+        return '░' * width
+    filled = round(amount / max_amount * width)
+    return '█' * filled + '░' * (width - filled)
+
+
+async def render_finance_report(callback: types.CallbackQuery):
+    """Monthly report: categories bar chart + prev month comparison."""
+    from app.models import Transaction
+    async with async_session() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        now = datetime.utcnow()
+        # Current month
+        cur_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # Prev month
+        prev_end = cur_start - timedelta(seconds=1)
+        prev_start = prev_end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        def month_query(start, end, tx_type):
+            return select(Transaction.category, func.sum(Transaction.amount)).where(
+                and_(Transaction.user_id == user.id,
+                     Transaction.type == tx_type,
+                     Transaction.created_at >= start,
+                     Transaction.created_at <= end)
+            ).group_by(Transaction.category).order_by(func.sum(Transaction.amount).desc())
+
+        cur_exp_r = await session.execute(month_query(cur_start, now, TransactionType.expense))
+        cur_inc_r = await session.execute(
+            select(func.sum(Transaction.amount)).where(
+                and_(Transaction.user_id == user.id, Transaction.type == TransactionType.income,
+                     Transaction.created_at >= cur_start))
+        )
+        prev_exp_r = await session.execute(month_query(prev_start, prev_end, TransactionType.expense))
+        prev_inc_r = await session.execute(
+            select(func.sum(Transaction.amount)).where(
+                and_(Transaction.user_id == user.id, Transaction.type == TransactionType.income,
+                     Transaction.created_at >= prev_start, Transaction.created_at <= prev_end))
+        )
+
+    cur_cats = {c: v for c, v in cur_exp_r.all()}
+    prev_cats = {c: v for c, v in prev_exp_r.all()}
+    cur_inc = cur_inc_r.scalar() or 0
+    prev_inc = prev_inc_r.scalar() or 0
+    cur_exp = sum(cur_cats.values())
+    prev_exp = sum(prev_cats.values())
+    max_cat = max(cur_cats.values(), default=1)
+
+    # Also enrich from Google Sheets if available
+    sheets_exp = 0
+    sheets_inc = 0
+    if SHEETS_ENABLED:
+        try:
+            sh_ctx = await asyncio.get_event_loop().run_in_executor(None, get_sheet_context)
+            sheets_exp = sh_ctx.get("month_expense", 0)
+            sheets_inc = sh_ctx.get("month_income", 0)
+            if not cur_cats and sh_ctx.get("month_by_cat"):
+                cur_cats = sh_ctx["month_by_cat"]
+                max_cat = max(cur_cats.values(), default=1)
+                cur_exp = sheets_exp
+                cur_inc = sheets_inc
+        except Exception:
+            pass
+
+    mon = now.strftime("%B %Y")
+    text = f"<b>📊 Отчёт: {mon}</b>\n\n"
+    text += f"➕ Доход:  {fmt_money(cur_inc or sheets_inc)}\n"
+    text += f"➖ Расходы: {fmt_money(cur_exp or sheets_exp)}\n"
+    text += f"💾 Баланс:  {fmt_money((cur_inc or sheets_inc) - (cur_exp or sheets_exp))}\n"
+
+    # Prev month diff
+    if prev_exp > 0 and cur_exp > 0:
+        diff = cur_exp - prev_exp
+        arrow = "📈" if diff > 0 else "📉"
+        text += f"{arrow} vs прошлый месяц: {'+' if diff>0 else ''}{fmt_money(diff)}\n"
+
+    if cur_cats:
+        text += "\n<b>Расходы по категориям:</b>\n"
+        for cat, amt in sorted(cur_cats.items(), key=lambda x: x[1], reverse=True)[:10]:
+            b = bar(amt, max_cat, 8)
+            prev = prev_cats.get(cat, 0)
+            trend = " 📈" if amt > prev * 1.2 and prev > 0 else (" 📉" if amt < prev * 0.8 and prev > 0 else "")
+            text += f"<code>[{b}]</code> {fmt_money(amt)} {cat}{trend}\n"
+    else:
+        text += "\n<i>Нет данных за этот месяц. Запиши первую трату!</i>"
+
+    await callback.message.edit_text(text, reply_markup=kb([
+        [InlineKeyboardButton(text="📋 История", callback_data="finance:list:0")],
+        [back_btn("menu:finance")],
+    ]), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+async def render_finance_history(callback: types.CallbackQuery, page: int = 0):
+    """Paginated transaction history."""
+    from app.models import Transaction
+    PAGE = 10
+    async with async_session() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        count_r = await session.execute(
+            select(func.count()).where(Transaction.user_id == user.id)
+        )
+        total = count_r.scalar() or 0
+        txs_r = await session.execute(
+            select(Transaction)
+            .where(Transaction.user_id == user.id)
+            .order_by(Transaction.created_at.desc())
+            .offset(page * PAGE).limit(PAGE)
+        )
+        txs = txs_r.scalars().all()
+
+    if not txs:
+        await callback.message.edit_text(
+            "📭 Нет операций.",
+            reply_markup=kb([[back_btn("menu:finance")]]), parse_mode=ParseMode.HTML)
+        await callback.answer()
+        return
+
+    total_pages = (total + PAGE - 1) // PAGE
+    text = f"<b>📋 История операций</b> (стр. {page+1}/{total_pages})\n\n"
+    for t in txs:
+        sign = "➕" if t.type == TransactionType.income else "➖"
+        d = t.created_at.strftime("%d.%m") if t.created_at else "?"
+        desc = f" — {t.description[:25]}" if t.description else ""
+        text += f"{sign} {d} <b>{fmt_money(t.amount)}</b> [{t.category}]{desc}\n"
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"finance:list:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"finance:list:{page+1}"))
+
+    buttons = []
+    if nav:
+        buttons.append(nav)
+    buttons.append([back_btn("menu:finance")])
+    await callback.message.edit_text(text, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    await callback.answer()
 
 
 async def render_finance_balance(callback: types.CallbackQuery):
@@ -490,6 +700,15 @@ async def handle_callback(callback: types.CallbackQuery):
             await render_finance_balance(callback)
             return
 
+        if data == "finance:report":
+            await render_finance_report(callback)
+            return
+
+        if action == "finance" and parts[1] == "list":
+            page = int(parts[2]) if len(parts) > 2 else 0
+            await render_finance_history(callback, page)
+            return
+
         if data == "finance:add_income":
             await callback.message.edit_text(
                 "💵 <b>Запись дохода</b>\n\nНапиши, например:\n<code>Получил зарплату 150000</code>",
@@ -544,6 +763,27 @@ async def handle_callback(callback: types.CallbackQuery):
             else:
                 await callback.answer(f"💰 +{fmt_money(amount)}")
             await render_wish_detail(callback, parts[2])
+            return
+
+        # ── TRANSACTION CANCEL (inline button after recording) ──
+        if action == "tx" and parts[1] == "cancel":
+            from app.models import Transaction
+            tx_id = parts[2]
+            async with async_session() as session:
+                result = await session.execute(select(Transaction).where(Transaction.id == tx_id))
+                tx = result.scalar_one_or_none()
+                if tx:
+                    amt = tx.amount
+                    cat = tx.category
+                    await session.delete(tx)
+                    await session.commit()
+                    _session.pop(callback.from_user.id, None)
+                    await callback.message.edit_text(
+                        f"🗑 <b>Операция отменена</b>\n\nУдалено: {fmt_money(amt)} — {cat}",
+                        reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+                else:
+                    await callback.answer("Операция не найдена", show_alert=True)
+            await callback.answer()
             return
 
         if action == "wish" and parts[1] == "delete":
@@ -687,19 +927,21 @@ async def handle_free_text(message: types.Message, text: str):
             reply_markup=main_menu(), parse_mode=ParseMode.HTML)
         return
 
-    # 0.7. Cancel last transaction
+    # 0.7. Cancel / edit last transaction
     if msg_type == "cancel_transaction":
-        from sqlalchemy import delete as sql_delete
         from app.models import Transaction
         async with async_session() as session:
             user = await get_or_create_user(session, message.from_user.id)
-            # Find the most recent transaction
-            result = await session.execute(
-                select(Transaction)
-                .where(Transaction.user_id == user.id)
-                .order_by(Transaction.created_at.desc())
-                .limit(1)
-            )
+            # Try session memory first, fallback to last in DB
+            sess = _session.get(message.from_user.id, {})
+            last_id = sess.get("last_tx_id")
+            if last_id:
+                result = await session.execute(select(Transaction).where(Transaction.id == last_id))
+            else:
+                result = await session.execute(
+                    select(Transaction).where(Transaction.user_id == user.id)
+                    .order_by(Transaction.created_at.desc()).limit(1)
+                )
             last_tx = result.scalar_one_or_none()
             if last_tx:
                 desc = last_tx.description or ""
@@ -707,15 +949,13 @@ async def handle_free_text(message: types.Message, text: str):
                 cat = last_tx.category
                 await session.delete(last_tx)
                 await session.commit()
+                _session.pop(message.from_user.id, None)
                 await message.answer(
-                    f"🗑 <b>Операция отменена</b>\n\n"
-                    f"Удалено: {fmt_money(amt)} — {cat}\n"
-                    f"{desc[:80] if desc else ''}",
+                    f"🗑 <b>Операция отменена</b>\n\nУдалено: {fmt_money(amt)} — {cat}"
+                    f"{chr(10) + desc[:80] if desc else ''}",
                     reply_markup=main_menu(), parse_mode=ParseMode.HTML)
             else:
-                await message.answer(
-                    "🤷 Нет операций для отмены.",
-                    reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+                await message.answer("🤷 Нет операций для отмены.", reply_markup=main_menu(), parse_mode=ParseMode.HTML)
         return
 
     # 1. Finance settings
@@ -738,10 +978,12 @@ async def handle_free_text(message: types.Message, text: str):
     if msg_type == "finance_transaction":
         async with async_session() as session:
             user = await get_or_create_user(session, message.from_user.id)
-            await add_transaction(
+            tx = await add_transaction(
                 session, user.id, amount=parsed["amount"] * 100,
                 type_=TransactionType.income if parsed["type_tx"] == "income" else TransactionType.expense,
                 category=parsed["category"], description=parsed.get("description", text[:200]))
+        # Save to session for undo/edit
+        _session[message.from_user.id] = {"last_tx_id": str(tx.id), "last_amount": parsed["amount"], "last_cat": parsed["category"]}
         # Also write to Google Sheet
         if SHEETS_ENABLED:
             try:
@@ -760,7 +1002,10 @@ async def handle_free_text(message: types.Message, text: str):
         sign = "Доход" if parsed["type_tx"] == "income" else "Расход"
         await message.answer(
             f"{emoji} <b>{sign} записан!</b>\n\nСумма: {parsed['amount']:,.0f}₸\nКатегория: {parsed['category']}\n📊 Записано в таблицу",
-            reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+            reply_markup=kb([
+                [InlineKeyboardButton(text="🗑 Отменить", callback_data=f"tx:cancel:{tx.id}")],
+                [InlineKeyboardButton(text="← Меню", callback_data="menu:main")],
+            ]), parse_mode=ParseMode.HTML)
         return
 
     # 3. Wish
