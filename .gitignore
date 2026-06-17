@@ -14,3 +14,5 @@ alembic/versions/*.pyc
 *.json.key
 gen-lang-client-*.json
 credentials*.json
+*.pdf
+.DS_Store
